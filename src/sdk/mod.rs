@@ -45,7 +45,7 @@ pub mod user;
 
 use crate::{TrackerError, TrackerResult};
 use godot::classes::http_client::Method;
-use godot::classes::{Engine, HttpRequest, Os};
+use godot::classes::{Engine, HttpRequest, Os, os};
 use godot::global::Error;
 use godot::prelude::*;
 use serde::Serialize;
@@ -71,6 +71,22 @@ impl Display for TrackType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
     }
+}
+
+pub fn user_agent() -> String {
+    let engine_version = Engine::singleton()
+        .get_version_info()
+        .get("string")
+        .unwrap_or_default();
+    let os_name = Os::singleton().get_name();
+    let os_version = Os::singleton().get_version();
+    let cargo_version = env!("CARGO_PKG_VERSION");
+    let device_type = Os::singleton().get_model_name();
+
+    format!(
+        "OpenPanelRustSDK/{} ({}; {} {}) Godot Engine/{}",
+        cargo_version, device_type, os_name, os_version, engine_version
+    )
 }
 
 pub struct HttpRequestResult {
@@ -103,7 +119,12 @@ pub struct Tracker {
 impl Tracker {
     /// Create new tracker instance
     /// Load configuration from .env file
-    pub fn new(tree: Gd<SceneTree>, api_url: String, client_id: String, client_secret: String) -> Self {
+    pub fn new(
+        tree: Gd<SceneTree>,
+        api_url: String,
+        client_id: String,
+        client_secret: String,
+    ) -> Self {
         let http_client = HttpRequest::new_alloc();
         tree.get_root().unwrap().add_child(&http_client);
 
@@ -112,7 +133,10 @@ impl Tracker {
             client_id,
             client_secret,
             http_client,
-            headers: PackedStringArray::new(),
+            headers: PackedStringArray::from([
+                GString::from("Content-Type: application/json"),
+                GString::from(format!("User-Agent: {}", user_agent())),
+            ]),
             global_props: HashMap::new(),
             disabled: false,
         }
@@ -159,8 +183,11 @@ impl Tracker {
         self
     }
 
-    pub fn filter(self, properties: Option<Dictionary>,
-        filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,) -> bool {
+    pub fn filter(
+        self,
+        properties: Option<Dictionary>,
+        filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
+    ) -> bool {
         let properties_map = properties.map(|p| dict_to_hashmap(p));
 
         if let Some(filter) = filter {
@@ -189,20 +216,21 @@ impl Tracker {
         let properties = self.create_properties_with_globals(properties_map);
         let payload = if profile_id.is_some() {
             serde_json::json!({
-            "type": TrackType::Track,
-            "payload": {
-                "profileId": profile_id,
-                "name": event,
-                "properties": properties
-            }
-        })} else {
+                "type": TrackType::Track,
+                "payload": {
+                    "profileId": profile_id,
+                    "name": event,
+                    "properties": properties
+                }
+            })
+        } else {
             serde_json::json!({
-            "type": TrackType::Track,
-            "payload": {
-                "name": event,
-                "properties": properties
-            }
-        })
+                "type": TrackType::Track,
+                "payload": {
+                    "name": event,
+                    "properties": properties
+                }
+            })
         };
 
         self.send_request(payload).await
@@ -273,8 +301,12 @@ impl Tracker {
 
         properties.extend(local_props);
 
-        self.track("revenue".to_string(), profile_id, Some(Dictionary::from_iter(properties)))
-            .await
+        self.track(
+            "revenue".to_string(),
+            profile_id,
+            Some(Dictionary::from_iter(properties)),
+        )
+        .await
     }
 
     pub async fn fetch_device_id(&mut self) -> TrackerResult<String> {
