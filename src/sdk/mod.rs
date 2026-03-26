@@ -44,12 +44,13 @@
 pub mod user;
 
 use crate::{TrackerError, TrackerResult};
-use reqwest::header::{HeaderMap, HeaderName};
-use reqwest::{Body, Response};
+use godot::classes::http_client::Method;
+use godot::classes::{Engine, HttpRequest, Os};
+use godot::global::Error;
+use godot::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::str::FromStr;
 
 /// Type of event to track
 #[derive(Debug, Default, Serialize)]
@@ -72,13 +73,29 @@ impl Display for TrackType {
     }
 }
 
+pub struct HttpRequestResult {
+    pub result: godot::classes::http_request::Result,
+    pub response_code: i64,
+    pub headers: PackedStringArray,
+    pub body: PackedByteArray,
+}
+
+pub fn dict_to_hashmap(dict: Dictionary) -> HashMap<String, String> {
+    let mut hashmap = HashMap::new();
+    for (key, value) in dict.iter_shared() {
+        hashmap.insert(key.to_string(), value.to_string());
+    }
+    hashmap
+}
+
 /// OpenPanel SDK for tracking events
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tracker {
     api_url: String,
     client_id: String,
     client_secret: String,
-    headers: HeaderMap,
+    http_client: Gd<HttpRequest>,
+    headers: PackedStringArray,
     global_props: HashMap<String, String>,
     disabled: bool,
 }
@@ -86,39 +103,35 @@ pub struct Tracker {
 impl Tracker {
     /// Create new tracker instance
     /// Load configuration from .env file
-    pub fn try_new_from_env() -> TrackerResult<Self> {
-        dotenvy::dotenv()?;
+    pub fn new(tree: Gd<SceneTree>, api_url: String, client_id: String, client_secret: String) -> Self {
+        let http_client = HttpRequest::new_alloc();
+        tree.get_root().unwrap().add_child(&http_client);
 
-        let api_url = std::env::var("OPENPANEL_TRACK_URL")?;
-        let client_id = std::env::var("OPENPANEL_CLIENT_ID")?;
-        let client_secret = std::env::var("OPENPANEL_CLIENT_SECRET")?;
-
-        Ok(Self {
+        Self {
             api_url,
             client_id,
             client_secret,
-            headers: HeaderMap::new(),
+            http_client,
+            headers: PackedStringArray::new(),
             global_props: HashMap::new(),
             disabled: false,
-        })
+        }
     }
 
     /// Set default headers for tracker object
     pub fn with_default_headers(mut self) -> TrackerResult<Self> {
-        self.headers.insert(
-            HeaderName::from_str("Content-Type")?,
-            "application/json".parse()?,
-        );
+        self.headers
+            .push(&GString::from("Content-Type: application/json"));
 
-        self.headers.insert(
-            HeaderName::from_str("openpanel-client-id")?,
-            self.client_id.parse()?,
-        );
+        self.headers.push(&GString::from(format!(
+            "openpanel-client-id: {}",
+            self.client_id
+        )));
 
-        self.headers.insert(
-            HeaderName::from_str("openpanel-client-secret")?,
-            self.client_secret.parse()?,
-        );
+        self.headers.push(&GString::from(format!(
+            "openpanel-client-secret: {}",
+            self.client_secret
+        )));
 
         Ok(self)
     }
@@ -127,7 +140,7 @@ impl Tracker {
     /// Use this to set custom headers used for e.g. geo location
     pub fn with_header(mut self, key: String, value: String) -> TrackerResult<Self> {
         self.headers
-            .insert(HeaderName::from_str(key.as_str())?, value.parse()?);
+            .push(&GString::from(format!("{}: {}", key, value)));
 
         Ok(self)
     }
@@ -146,6 +159,18 @@ impl Tracker {
         self
     }
 
+    pub fn filter(self, properties: Option<Dictionary>,
+        filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,) -> bool {
+        let properties_map = properties.map(|p| dict_to_hashmap(p));
+
+        if let Some(filter) = filter {
+            if filter(self.create_properties_with_globals(properties_map.clone())) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Track event on OpenPanel
     ///
     /// # Parameters:
@@ -154,33 +179,40 @@ impl Tracker {
     /// - filter [Option<&dyn Fn(HashMap<String, String>) -> bool>]: If provided, the filter fn will
     ///     be applied onto the payload. If the result is true, the event won't be sent
     pub async fn track(
-        &self,
+        &mut self,
         event: String,
         profile_id: Option<String>,
-        properties: Option<HashMap<String, String>>,
-        filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
-    ) -> TrackerResult<Response> {
-        if let Some(filter) = filter {
-            if filter(self.create_properties_with_globals(properties.clone())) {
-                return Err(TrackerError::Filtered);
-            }
-        }
+        properties: Option<Dictionary>,
+    ) -> TrackerResult<HttpRequestResult> {
+        let properties_map = properties.map(|p| dict_to_hashmap(p));
 
-        let properties = self.create_properties_with_globals(properties);
-        let payload = serde_json::json!({
+        let properties = self.create_properties_with_globals(properties_map);
+        let payload = if profile_id.is_some() {
+            serde_json::json!({
             "type": TrackType::Track,
             "payload": {
                 "profileId": profile_id,
                 "name": event,
                 "properties": properties
             }
-        });
+        })} else {
+            serde_json::json!({
+            "type": TrackType::Track,
+            "payload": {
+                "name": event,
+                "properties": properties
+            }
+        })
+        };
 
         self.send_request(payload).await
     }
 
     /// Identify user on OpenPanel
-    pub async fn identify(&self, mut user: user::IdentifyUser) -> TrackerResult<Response> {
+    pub async fn identify(
+        &mut self,
+        mut user: user::IdentifyUser,
+    ) -> TrackerResult<HttpRequestResult> {
         user.properties = self.create_properties_with_globals(Some(user.properties));
 
         let payload = serde_json::json!({
@@ -193,11 +225,11 @@ impl Tracker {
 
     /// Decrement property value on OpenPanel
     pub async fn decrement(
-        &self,
+        &mut self,
         profile_id: String,
         property: String,
         value: i64,
-    ) -> TrackerResult<Response> {
+    ) -> TrackerResult<HttpRequestResult> {
         let payload = serde_json::json!({
           "type": TrackType::Decrement,
           "payload": {
@@ -212,11 +244,11 @@ impl Tracker {
 
     /// Decrement property value on OpenPanel
     pub async fn increment(
-        &self,
+        &mut self,
         profile_id: String,
         property: String,
         value: i64,
-    ) -> TrackerResult<Response> {
+    ) -> TrackerResult<HttpRequestResult> {
         let payload = serde_json::json!({
           "type": TrackType::Increment,
           "payload": {
@@ -230,36 +262,57 @@ impl Tracker {
     }
 
     pub async fn revenue(
-        &self,
+        &mut self,
         profile_id: Option<String>,
         amount: i64,
-        properties: Option<HashMap<String, String>>,
-    ) -> TrackerResult<Response> {
+        properties: Option<Dictionary>,
+    ) -> TrackerResult<HttpRequestResult> {
         let local_props = HashMap::from([("__revenue".to_string(), amount.to_string())]);
-        let mut properties = self.create_properties_with_globals(properties.clone());
+        let mut properties =
+            self.create_properties_with_globals(properties.map(|p| dict_to_hashmap(p)));
 
         properties.extend(local_props);
 
-        self.track("revenue".to_string(), profile_id, Some(properties), None)
+        self.track("revenue".to_string(), profile_id, Some(Dictionary::from_iter(properties)))
             .await
     }
 
-    pub async fn fetch_device_id(&self) -> TrackerResult<String> {
+    pub async fn fetch_device_id(&mut self) -> TrackerResult<String> {
         if self.disabled {
             return Err(TrackerError::Disabled);
         }
 
         let url = format!("{}/device-id", self.api_url);
-        tracing::debug!("Sending request to {}", url);
+        if Engine::singleton().is_editor_hint() {
+            // tracing::debug!("Tracker is running in editor, skipping fetching device ID");
+            // return Err(TrackerError::Disabled);
+        }
+        if Os::singleton().is_debug_build() {
+            godot_print!("Fetching device ID from {}", url);
+        }
 
-        let client = reqwest::Client::new();
-        let res = client
-            .get(url.as_str())
-            .headers(self.headers.clone())
-            .send()
-            .await?;
-        let body = res.text().await?;
-        let json = serde_json::from_str::<HashMap<String, String>>(&body)?;
+        let err = self
+            .http_client
+            .request_ex(url.as_str())
+            .custom_headers(&self.headers)
+            .done();
+
+        if err != Error::OK {
+            godot_error!("Failed to send request: {:?}", err);
+            return Err(TrackerError::Request);
+        }
+
+        let (result, _response_code, _headers, body) = self
+            .http_client
+            .signals()
+            .request_completed()
+            .to_future()
+            .await;
+        if result != godot::classes::http_request::Result::SUCCESS.ord() as i64 {
+            godot_error!("Failed to fetch device ID: {:?}", result);
+            return Err(TrackerError::Request);
+        }
+        let json = serde_json::from_str::<HashMap<String, String>>(body.to_string().as_str())?;
         let id = if !json.contains_key("deviceId") {
             return Ok("".to_string());
         } else {
@@ -283,256 +336,282 @@ impl Tracker {
     }
 
     /// Actually send the request to the API
-    async fn send_request(&self, payload: serde_json::Value) -> TrackerResult<Response> {
+    async fn send_request(
+        &mut self,
+        payload: serde_json::Value,
+    ) -> TrackerResult<HttpRequestResult> {
         if self.disabled {
             return Err(TrackerError::Disabled);
         }
 
-        tracing::debug!("Sending request to {}", self.api_url);
-        tracing::debug!(
-            "Sending payload {:?}",
-            serde_json::to_string_pretty(&payload)?
-        );
+        if Engine::singleton().is_editor_hint() {
+            // tracing::debug!("Tracker is running in editor, skipping sending request");
+            // return Err(TrackerError::Disabled);
+        }
+        if Os::singleton().is_debug_build() {
+            godot_print!("Sending request to {}", self.api_url);
+            godot_print!(
+                "Sending payload:\n{}",
+                serde_json::to_string_pretty(&payload)?
+            );
+        }
 
-        let client = reqwest::Client::new();
-        let res = client
-            .post(self.api_url.as_str())
-            .body(Body::wrap(serde_json::to_string(&payload)?))
-            .headers(self.headers.clone())
-            .send()
-            .await?;
+        let err = self
+            .http_client
+            .request_ex(self.api_url.as_str())
+            .request_data(&serde_json::to_string(&payload)?)
+            .custom_headers(&self.headers)
+            .method(Method::POST)
+            .done();
 
-        Ok(res)
-    }
-}
+        if err != Error::OK {
+            godot_error!("Failed to send request: {:?}", err);
+            return Err(TrackerError::Request);
+        }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use reqwest::header::HeaderValue;
-    use serde_json::json;
-
-    fn get_profile_id() -> Option<String> {
-        Some("rust_123123123".to_string())
-    }
-
-    #[test]
-    fn can_set_default_headers() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-
-        assert_eq!(
-            tracker.headers.get("Content-Type").unwrap(),
-            "application/json".parse::<HeaderValue>()?
-        );
-        assert_eq!(
-            tracker.headers.get("openpanel-client-id").unwrap(),
-            std::env::var("OPENPANEL_CLIENT_ID")
-                .unwrap()
-                .parse::<HeaderValue>()?
-        );
-        assert_eq!(
-            tracker.headers.get("openpanel-client-secret").unwrap(),
-            std::env::var("OPENPANEL_CLIENT_SECRET")
-                .unwrap()
-                .parse::<HeaderValue>()?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn can_set_custom_header() -> anyhow::Result<()> {
-        let tracker =
-            Tracker::try_new_from_env()?.with_header("test".to_string(), "test".to_string())?;
-
-        assert_eq!(
-            tracker.headers.get("test").unwrap(),
-            "test".parse::<HeaderValue>()?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn can_create_properties_with_globals() -> anyhow::Result<()> {
-        let properties = HashMap::from([("test".to_string(), "test".to_string())]);
-        let tracker = Tracker::try_new_from_env()?.with_global_properties(properties.clone());
-        let properties_with_globals =
-            tracker.create_properties_with_globals(Some(properties.clone()));
-
-        assert_eq!(tracker.global_props, properties_with_globals);
-
-        Ok(())
-    }
-
-    #[test]
-    fn can_set_global_properties() -> anyhow::Result<()> {
-        let properties = HashMap::from([("test".to_string(), "test".to_string())]);
-        let tracker = Tracker::try_new_from_env()?.with_global_properties(properties.clone());
-
-        assert_eq!(tracker.global_props, properties);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_send_request() -> anyhow::Result<()> {
-        let payload = json!({
-          "type": TrackType::Track,
-          "payload": {
-            "name": "test_event",
-            "properties": {
-              "name": "rust"
-            }
-          }
-        });
-
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let response = tracker.send_request(payload).await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cannot_send_request_if_disabled() -> anyhow::Result<()> {
-        let payload = json!({
-          "type": TrackType::Track,
-          "payload": {
-            "name": "test_event",
-            "properties": {
-              "name": "rust"
-            }
-          }
-        });
-
-        let tracker = Tracker::try_new_from_env()?
-            .with_default_headers()?
-            .disable();
-        let response = tracker.send_request(payload).await;
-
-        assert!(response.is_err());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_track_event() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let mut properties = HashMap::new();
-
-        properties.insert("name".to_string(), "rust".to_string());
-
-        let response = tracker
-            .track(
-                "test_event".to_string(),
-                get_profile_id(),
-                Some(properties),
-                None,
-            )
-            .await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_filter_track_event() -> anyhow::Result<()> {
-        let filter = |properties: HashMap<String, String>| properties.contains_key("name");
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let mut properties = HashMap::new();
-
-        properties.insert("name".to_string(), "rust".to_string());
-
-        let response = tracker
-            .track(
-                "test_event".to_string(),
-                get_profile_id(),
-                Some(properties),
-                Some(&filter),
-            )
+        let (result, response_code, headers, body) = self
+            .http_client
+            .signals()
+            .request_completed()
+            .to_future()
             .await;
 
-        assert!(response.is_err());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_identify_user() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let mut properties = HashMap::new();
-
-        properties.insert("name".to_string(), "rust".to_string());
-
-        let user = user::IdentifyUser {
-            profile_id: "test_profile_id".to_string(),
-            email: "rust@test.com".to_string(),
-            first_name: "Rust".to_string(),
-            last_name: "Rust".to_string(),
-            properties,
-        };
-
-        let response = tracker.identify(user).await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_increment_property() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let response = tracker
-            .increment(
-                "test_profile_id".to_string(),
-                "test_property".to_string(),
-                1,
-            )
-            .await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_decrement_property() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let response = tracker
-            .decrement(
-                "test_profile_id".to_string(),
-                "test_property".to_string(),
-                1,
-            )
-            .await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_track_revenue() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-        let response = tracker.revenue(get_profile_id(), 100, None).await?;
-
-        assert_eq!(response.status(), 200);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn can_fetch_device_id() -> anyhow::Result<()> {
-        let tracker = Tracker::try_new_from_env()?
-            .with_default_headers()?
-            .with_header("user-agent".to_string(), "some".to_string())?;
-        let id = tracker.fetch_device_id().await?;
-
-        assert!(!id.is_empty());
-
-        Ok(())
+        Ok(HttpRequestResult {
+            result: godot::classes::http_request::Result::from_ord(result as i32),
+            response_code,
+            headers,
+            body,
+        })
     }
 }
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use reqwest::header::HeaderValue;
+//     use serde_json::json;
+
+//     fn get_profile_id() -> Option<String> {
+//         Some("rust_123123123".to_string())
+//     }
+
+//     #[test]
+//     fn can_set_default_headers() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+
+//         assert_eq!(
+//             tracker.headers.get("Content-Type").unwrap(),
+//             "application/json".parse::<HeaderValue>()?
+//         );
+//         assert_eq!(
+//             tracker.headers.get("openpanel-client-id").unwrap(),
+//             std::env::var("OPENPANEL_CLIENT_ID")
+//                 .unwrap()
+//                 .parse::<HeaderValue>()?
+//         );
+//         assert_eq!(
+//             tracker.headers.get("openpanel-client-secret").unwrap(),
+//             std::env::var("OPENPANEL_CLIENT_SECRET")
+//                 .unwrap()
+//                 .parse::<HeaderValue>()?
+//         );
+
+//         Ok(())
+//     }
+
+//     #[test]
+//     fn can_set_custom_header() -> anyhow::Result<()> {
+//         let tracker =
+//             Tracker::try_new_from_env()?.with_header("test".to_string(), "test".to_string())?;
+
+//         assert_eq!(
+//             tracker.headers.get("test").unwrap(),
+//             "test".parse::<HeaderValue>()?
+//         );
+
+//         Ok(())
+//     }
+
+//     #[test]
+//     fn can_create_properties_with_globals() -> anyhow::Result<()> {
+//         let properties = HashMap::from([("test".to_string(), "test".to_string())]);
+//         let tracker = Tracker::try_new_from_env()?.with_global_properties(properties.clone());
+//         let properties_with_globals =
+//             tracker.create_properties_with_globals(Some(properties.clone()));
+
+//         assert_eq!(tracker.global_props, properties_with_globals);
+
+//         Ok(())
+//     }
+
+//     #[test]
+//     fn can_set_global_properties() -> anyhow::Result<()> {
+//         let properties = HashMap::from([("test".to_string(), "test".to_string())]);
+//         let tracker = Tracker::try_new_from_env()?.with_global_properties(properties.clone());
+
+//         assert_eq!(tracker.global_props, properties);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_send_request() -> anyhow::Result<()> {
+//         let payload = json!({
+//           "type": TrackType::Track,
+//           "payload": {
+//             "name": "test_event",
+//             "properties": {
+//               "name": "rust"
+//             }
+//           }
+//         });
+
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let response = tracker.send_request(payload).await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn cannot_send_request_if_disabled() -> anyhow::Result<()> {
+//         let payload = json!({
+//           "type": TrackType::Track,
+//           "payload": {
+//             "name": "test_event",
+//             "properties": {
+//               "name": "rust"
+//             }
+//           }
+//         });
+
+//         let tracker = Tracker::try_new_from_env()?
+//             .with_default_headers()?
+//             .disable();
+//         let response = tracker.send_request(payload).await;
+
+//         assert!(response.is_err());
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_track_event() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let mut properties = HashMap::new();
+
+//         properties.insert("name".to_string(), "rust".to_string());
+
+//         let response = tracker
+//             .track(
+//                 "test_event".to_string(),
+//                 get_profile_id(),
+//                 Some(properties),
+//                 None,
+//             )
+//             .await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_filter_track_event() -> anyhow::Result<()> {
+//         let filter = |properties: HashMap<String, String>| properties.contains_key("name");
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let mut properties = HashMap::new();
+
+//         properties.insert("name".to_string(), "rust".to_string());
+
+//         let response = tracker
+//             .track(
+//                 "test_event".to_string(),
+//                 get_profile_id(),
+//                 Some(properties),
+//                 Some(&filter),
+//             )
+//             .await;
+
+//         assert!(response.is_err());
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_identify_user() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let mut properties = HashMap::new();
+
+//         properties.insert("name".to_string(), "rust".to_string());
+
+//         let user = user::IdentifyUser {
+//             profile_id: "test_profile_id".to_string(),
+//             email: "rust@test.com".to_string(),
+//             first_name: "Rust".to_string(),
+//             last_name: "Rust".to_string(),
+//             properties,
+//         };
+
+//         let response = tracker.identify(user).await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_increment_property() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let response = tracker
+//             .increment(
+//                 "test_profile_id".to_string(),
+//                 "test_property".to_string(),
+//                 1,
+//             )
+//             .await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_decrement_property() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let response = tracker
+//             .decrement(
+//                 "test_profile_id".to_string(),
+//                 "test_property".to_string(),
+//                 1,
+//             )
+//             .await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_track_revenue() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+//         let response = tracker.revenue(get_profile_id(), 100, None).await?;
+
+//         assert_eq!(response.status(), 200);
+
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_fetch_device_id() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?
+//             .with_default_headers()?
+//             .with_header("user-agent".to_string(), "some".to_string())?;
+//         let id = tracker.fetch_device_id().await?;
+
+//         assert!(!id.is_empty());
+
+//         Ok(())
+//     }
+// }

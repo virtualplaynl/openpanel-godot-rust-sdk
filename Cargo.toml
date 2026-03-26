@@ -1,33 +1,30 @@
 [package]
-name = "openpanel_rust"
+name = "openpanel_godot_rust"
 version = "0.3.2"
 edition = "2024"
 rust-version = "1.85.1"
 description = """
 OpenPanel SDK for tracking events
 """
-authors = ["Thomas Stätter <thomas.staetter@gmail.com>"]
+authors = ["Thomas Stätter <thomas.staetter@gmail.com>", "Stephan van der Feest <stephan@virtualplay.nl>"]
 license = "MIT"
-keywords = ["web-tracking", "event-tracking", "openpanel"]
-categories = ["web-programming"]
+keywords = ["event-tracking", "openpanel", "godot"]
+categories = ["game-programming"]
 readme = "README.md"
-repository = "https://github.com/tstaetter/openpanel-rust-sdk.git"
-homepage = "https://github.com/tstaetter/openpanel-rust-sdk"
+repository = "https://github.com/virtualplaynl/openpanel-godot-rust-sdk.git"
+homepage = "https://github.com/virtualplaynl/openpanel-godot-rust-sdk"
 
 [lib]
-name = "openpanel_sdk"
+name = "openpanel_godot_sdk"
 path = "src/lib.rs"
 test = true
 crate-type = ["lib"]
 
 [dependencies]
-dotenvy = "0.15.7"
-reqwest = { version = "0.13.1", features = ["json"] }
+godot = { version = "0.3.5", features = ["experimental-threads"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1.41"
 
 [dev-dependencies]
 anyhow = "1.0.100"

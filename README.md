@@ -1,4 +1,4 @@
-# [OpenPanel](https://openpanel.dev/) Rust SDK
+# [OpenPanel](https://openpanel.dev/) Rust SDK for use with Godot Engine and godot-rust
 
 ## Features
 
@@ -8,6 +8,10 @@
 - Filter events
 
 ## Usage
+
+> [!CAUTION]
+> This documentation is not updated for this Godot version yet. Do not use like this!
+> As of the time of writing, only up to godot-rust 0.3.5 is tested.
 
 Set your env vars in `.env` file:
 
