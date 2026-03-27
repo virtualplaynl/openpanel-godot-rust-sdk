@@ -1,4 +1,4 @@
-//! Tracking user used for identify user calls
+/// Tracking user used for identify user calls
 
 use serde::Serialize;
 use std::collections::HashMap;

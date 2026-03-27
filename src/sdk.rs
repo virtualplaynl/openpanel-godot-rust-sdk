@@ -1,49 +1,48 @@
-//! OpenPanel SDK for tracking events
-//!
-//! # Example
-//!
-//! ```rust
-//! use openpanel_sdk::sdk::Tracker;
-//! use std::collections::HashMap;
-//!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-//!     let mut properties = HashMap::new();
-//!
-//!     properties.insert("name".to_string(), "rust".to_string());
-//!
-//!     tracker.track("test".to_string(), None, Some(properties), None).await?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! or apply filter
-//!
-//! ```rust
-//! use openpanel_sdk::sdk::Tracker;
-//! use std::collections::HashMap;
-//!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let filter = |properties: HashMap<String, String>| properties.contains_key("name");
-//!     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
-//!     let mut properties = HashMap::new();
-//!
-//!     properties.insert("name".to_string(), "rust".to_string());
-//!
-//!     // will return error because properties contain key "name"
-//!     let result = tracker.track("test".to_string(), None, Some(properties), Some(&filter)).await;
-//!
-//!     assert!(result.is_err());
-//!
-//!     Ok(())
-//! }
-//! ```
-pub mod user;
+/// OpenPanel SDK for tracking events
+///
+/// # Example
+///
+/// ```rust
+/// use openpanel_sdk::sdk::Tracker;
+/// use std::collections::HashMap;
+///
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+///     let mut properties = HashMap::new();
+///
+///     properties.insert("name".to_string(), "rust".to_string());
+///
+///     tracker.track("test".to_string(), None, Some(properties), None).await?;
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// or apply filter
+///
+/// ```rust
+/// use openpanel_sdk::sdk::Tracker;
+/// use std::collections::HashMap;
+///
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     let filter = |properties: HashMap<String, String>| properties.contains_key("name");
+///     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+///     let mut properties = HashMap::new();
+///
+///     properties.insert("name".to_string(), "rust".to_string());
+///
+///     // will return error because properties contain key "name"
+///     let result = tracker.track("test".to_string(), None, Some(properties), Some(&filter)).await;
+///
+///     assert!(result.is_err());
+///
+///     Ok(())
+/// }
+/// ```
 
-use crate::{TrackerError, TrackerResult};
+use crate::{TrackerError, TrackerResult, user};
 use godot::classes::http_client::Method;
 use godot::classes::{Engine, HttpRequest, Os};
 use godot::global::Error;
@@ -96,12 +95,20 @@ pub struct HttpRequestResult {
     pub body: PackedByteArray,
 }
 
-pub fn dict_to_hashmap(dict: Dictionary) -> HashMap<String, String> {
+pub fn dict_to_hashmap(dict: VarDictionary) -> HashMap<String, String> {
     let mut hashmap = HashMap::new();
     for (key, value) in dict.iter_shared() {
         hashmap.insert(key.to_string(), value.to_string());
     }
     hashmap
+}
+
+pub fn hashmap_to_dict(hashmap: HashMap<String, String>) -> VarDictionary {
+    let mut dict = VarDictionary::new();
+    for (key, value) in hashmap.iter() {
+        dict.set(key.clone(), value.clone());
+    }
+    dict
 }
 
 /// OpenPanel SDK for tracking events
@@ -136,7 +143,7 @@ impl Tracker {
             http_client,
             headers: PackedStringArray::from([
                 GString::from("Content-Type: application/json"),
-                GString::from(format!("User-Agent: {}", user_agent())),
+                GString::from(format!("User-Agent: {}", user_agent()).as_str()),
             ]),
             global_props: HashMap::new(),
             force_in_editor: false,
@@ -152,12 +159,12 @@ impl Tracker {
         self.headers.push(&GString::from(format!(
             "openpanel-client-id: {}",
             self.client_id
-        )));
+        ).as_str()));
 
         self.headers.push(&GString::from(format!(
             "openpanel-client-secret: {}",
             self.client_secret
-        )));
+        ).as_str()));
 
         Ok(self)
     }
@@ -166,7 +173,7 @@ impl Tracker {
     /// Use this to set custom headers used for e.g. geo location
     pub fn with_header(mut self, key: String, value: String) -> TrackerResult<Self> {
         self.headers
-            .push(&GString::from(format!("{}: {}", key, value)));
+            .push(&GString::from(format!("{}: {}", key, value).as_str()));
 
         Ok(self)
     }
@@ -178,20 +185,23 @@ impl Tracker {
         self
     }
 
-    pub fn force_in_editor(mut self, force: bool) -> Self {
+    pub fn force_in_editor(&mut self, force: bool) {
         self.force_in_editor = force;
-        self
     }
 
     /// Disable sending events to OpenPanel
-    pub fn disable(mut self, disable: bool) -> Self {
+    pub fn disable(&mut self, disable: bool) {
         self.disabled = disable;
-        self
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        godot_print!("Checking if tracker is disabled: disabled={}, force_in_editor={}, is_editor={}", self.disabled, self.force_in_editor, Os::singleton().has_feature("editor"));
+        self.disabled || (Os::singleton().has_feature("editor") && !self.force_in_editor)
     }
 
     pub fn filter(
         self,
-        properties: Option<Dictionary>,
+        properties: Option<VarDictionary>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) -> bool {
         let properties_map = properties.map(|p| dict_to_hashmap(p));
@@ -215,7 +225,7 @@ impl Tracker {
         &mut self,
         event: String,
         profile_id: Option<String>,
-        properties: Option<Dictionary>,
+        properties: Option<VarDictionary>,
     ) -> TrackerResult<HttpRequestResult> {
         let properties_map = properties.map(|p| dict_to_hashmap(p));
 
@@ -299,7 +309,7 @@ impl Tracker {
         &mut self,
         profile_id: Option<String>,
         amount: i64,
-        properties: Option<Dictionary>,
+        properties: Option<VarDictionary>,
     ) -> TrackerResult<HttpRequestResult> {
         let local_props = HashMap::from([("__revenue".to_string(), amount.to_string())]);
         let mut properties =
@@ -310,7 +320,7 @@ impl Tracker {
         self.track(
             "revenue".to_string(),
             profile_id,
-            Some(Dictionary::from_iter(properties)),
+            Some(VarDictionary::from_iter(properties)),
         )
         .await
     }
