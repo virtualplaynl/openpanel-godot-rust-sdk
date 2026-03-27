@@ -45,7 +45,7 @@ pub mod user;
 
 use crate::{TrackerError, TrackerResult};
 use godot::classes::http_client::Method;
-use godot::classes::{Engine, HttpRequest, Os, os};
+use godot::classes::{Engine, HttpRequest, Os};
 use godot::global::Error;
 use godot::prelude::*;
 use serde::Serialize;
@@ -113,6 +113,7 @@ pub struct Tracker {
     http_client: Gd<HttpRequest>,
     headers: PackedStringArray,
     global_props: HashMap<String, String>,
+    force_in_editor: bool,
     disabled: bool,
 }
 
@@ -138,6 +139,7 @@ impl Tracker {
                 GString::from(format!("User-Agent: {}", user_agent())),
             ]),
             global_props: HashMap::new(),
+            force_in_editor: false,
             disabled: false,
         }
     }
@@ -173,13 +175,17 @@ impl Tracker {
     /// `track` and `identify` event sent.
     pub fn with_global_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.global_props = properties;
+        self
+    }
 
+    pub fn force_in_editor(mut self, force: bool) -> Self {
+        self.force_in_editor = force;
         self
     }
 
     /// Disable sending events to OpenPanel
-    pub fn disable(mut self) -> Self {
-        self.disabled = true;
+    pub fn disable(mut self, disable: bool) -> Self {
+        self.disabled = disable;
         self
     }
 
@@ -315,9 +321,8 @@ impl Tracker {
         }
 
         let url = format!("{}/device-id", self.api_url);
-        if Engine::singleton().is_editor_hint() {
-            // tracing::debug!("Tracker is running in editor, skipping fetching device ID");
-            // return Err(TrackerError::Disabled);
+        if Engine::singleton().is_editor_hint() && !self.force_in_editor {
+            return Err(TrackerError::Disabled);
         }
         if Os::singleton().is_debug_build() {
             godot_print!("Fetching device ID from {}", url);
@@ -376,9 +381,8 @@ impl Tracker {
             return Err(TrackerError::Disabled);
         }
 
-        if Engine::singleton().is_editor_hint() {
-            // tracing::debug!("Tracker is running in editor, skipping sending request");
-            // return Err(TrackerError::Disabled);
+        if Engine::singleton().is_editor_hint() && !self.force_in_editor {
+            return Err(TrackerError::Disabled);
         }
         if Os::singleton().is_debug_build() {
             godot_print!("Sending request to {}", self.api_url);
