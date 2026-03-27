@@ -321,7 +321,7 @@ impl Tracker {
         }
 
         let url = format!("{}/device-id", self.api_url);
-        if Engine::singleton().is_editor_hint() && !self.force_in_editor {
+        if Os::singleton().has_feature("editor") && !self.force_in_editor {
             return Err(TrackerError::Disabled);
         }
         if Os::singleton().is_debug_build() {
@@ -381,7 +381,7 @@ impl Tracker {
             return Err(TrackerError::Disabled);
         }
 
-        if Engine::singleton().is_editor_hint() && !self.force_in_editor {
+        if Os::singleton().has_feature("editor") && !self.force_in_editor {
             return Err(TrackerError::Disabled);
         }
         if Os::singleton().is_debug_build() {
