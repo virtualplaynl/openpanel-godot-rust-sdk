@@ -41,10 +41,9 @@
 ///     Ok(())
 /// }
 /// ```
-
 use crate::{TrackerError, TrackerResult, user};
 use godot::classes::http_client::Method;
-use godot::classes::{Engine, HttpRequest, Os};
+use godot::classes::{ConfigFile, Engine, HttpRequest, Json, Os};
 use godot::global::Error;
 use godot::prelude::*;
 use serde::Serialize;
@@ -77,10 +76,25 @@ pub fn user_agent() -> String {
         .get_version_info()
         .get("string")
         .unwrap_or_default();
-    let os_name = Os::singleton().get_name();
+    let mut os_name = Os::singleton().get_name();
     let os_version = Os::singleton().get_version();
     let cargo_version = env!("CARGO_PKG_VERSION");
-    let device_type = Os::singleton().get_model_name();
+    let mut device_type = Os::singleton().get_model_name();
+    if os_name.to_lower() == "windows" {
+        device_type = ("Windows NT ".to_string() + &os_version.to_string())
+            .as_str()
+            .into();
+    } else if os_name.to_lower() == "macos" {
+        device_type = "Macintosh".into();
+    } else if os_name.to_lower() == "linux" {
+        device_type = ("X11; ".to_string() + &device_type.to_string())
+            .as_str()
+            .into();
+    } else if device_type.to_lower().begins_with("iphone") {
+        os_name = "CPU iPhone OS".into();
+    } else if device_type.to_lower().begins_with("ipad") {
+        os_name = "CPU iPad OS".into();
+    }
 
     format!(
         "OpenPanelRustSDK/{} ({}; {} {}) Godot Engine/{}",
@@ -106,83 +120,135 @@ pub fn dict_to_hashmap(dict: VarDictionary) -> HashMap<String, String> {
 pub fn hashmap_to_dict(hashmap: HashMap<String, String>) -> VarDictionary {
     let mut dict = VarDictionary::new();
     for (key, value) in hashmap.iter() {
-        dict.set(key.clone(), value.clone());
+        dict.set(&GString::from(key), &GString::from(value));
     }
     dict
 }
 
 /// OpenPanel SDK for tracking events
-#[derive(Debug, Clone)]
-pub struct Tracker {
+#[derive(GodotClass)]
+#[class(base=Node)]
+pub struct OpenPanelTracker {
     api_url: String,
-    client_id: String,
-    client_secret: String,
     http_client: Gd<HttpRequest>,
-    headers: PackedStringArray,
+    device_id: Option<String>,
+    headers: Dictionary<GString, GString>,
     global_props: HashMap<String, String>,
+    store_session_device: bool,
     force_in_editor: bool,
     disabled: bool,
+    base: Base<Node>,
 }
 
-impl Tracker {
-    /// Create new tracker instance
-    /// Load configuration from .env file
-    pub fn new(
-        tree: Gd<SceneTree>,
+#[godot_api]
+impl INode for OpenPanelTracker {
+    fn init(base: Base<Node>) -> Self {
+        let api_url = std::env::var("OPENPANEL_API_URL")
+            .unwrap_or_else(|_| "https://api.openpanel.dev".to_string());
+        let client_id = std::env::var("OPENPANEL_CLIENT_ID").unwrap_or_default();
+        let client_secret = std::env::var("OPENPANEL_CLIENT_SECRET").unwrap_or_default();
+        Self::_init_node(api_url, client_id, client_secret, true, false, true, base)
+    }
+
+    fn enter_tree(&mut self) {
+        let http_client = self.http_client.clone();
+        self.base_mut().add_child(&http_client);
+    }
+}
+
+impl OpenPanelTracker {
+    /// Create new tracker instance from string credentials
+    fn _init_node(
         api_url: String,
         client_id: String,
         client_secret: String,
+        store_session_device: bool,
+        force_in_editor: bool,
+        disabled: bool,
+        base: Base<Node>,
     ) -> Self {
-        let http_client = HttpRequest::new_alloc();
-        tree.get_root().unwrap().add_child(&http_client);
+        let mut config = ConfigFile::new_gd();
+        let device_id = if config.load("user://tracker.cfg") == Error::OK {
+            Some(config.get_value("tracker", "device_id").to_string())
+        } else {
+            None
+        };
 
         Self {
             api_url,
-            client_id,
-            client_secret,
-            http_client,
-            headers: PackedStringArray::from([
-                GString::from("Content-Type: application/json"),
-                GString::from(format!("User-Agent: {}", user_agent()).as_str()),
-            ]),
-            global_props: HashMap::new(),
-            force_in_editor: false,
-            disabled: false,
+            http_client: HttpRequest::new_alloc(),
+            device_id: device_id.clone(),
+            headers: idict! {
+                "Content-Type" => "application/json",
+                "User-Agent" => user_agent().as_str(),
+                "openpanel-client-id" => client_id.as_str(),
+                "openpanel-client-secret" => client_secret.as_str(),
+            },
+            global_props: if let Some(known_id) = device_id {
+                HashMap::from([("__deviceId".to_string(), known_id)])
+            } else {
+                HashMap::new()
+            },
+            store_session_device: store_session_device,
+            force_in_editor,
+            disabled,
+            base,
         }
     }
 
-    /// Set default headers for tracker object
-    pub fn with_default_headers(mut self) -> TrackerResult<Self> {
-        self.headers
-            .push(&GString::from("Content-Type: application/json"));
+    /// Sets credentials and options for the tracker.
+    pub fn set(
+        &mut self,
+        api_url: String,
+        client_id: String,
+        client_secret: String,
+        store_session_device: bool,
+        force_in_editor: bool,
+        disabled: bool,
+    ) {
+        self.api_url = api_url;
+        self.headers = idict! {
+            "Content-Type" => "application/json",
+            "User-Agent" => user_agent().as_str(),
+            "openpanel-client-id" => client_id.as_str(),
+            "openpanel-client-secret" => client_secret.as_str(),
+        };
+        self.store_session_device = store_session_device;
+        self.force_in_editor = force_in_editor;
+        self.disabled = disabled;
+    }
 
-        self.headers.push(&GString::from(format!(
-            "openpanel-client-id: {}",
-            self.client_id
-        ).as_str()));
+    pub fn set_device_id(&mut self, device_id: String) {
+        if self.store_session_device {
+            godot_print!("Storing tracking reference: {}", device_id);
+            self.device_id = Some(device_id.clone());
 
-        self.headers.push(&GString::from(format!(
-            "openpanel-client-secret: {}",
-            self.client_secret
-        ).as_str()));
+            let mut config = ConfigFile::new_gd();
+            config.set_value("tracker", "device_id", &Variant::from(device_id.clone()));
+            let err = config.save("user://tracker.cfg");
+            if err != Error::OK {
+                godot_error!("Failed to save device ID to config: {:?}", err);
+            }
 
-        Ok(self)
+            self.global_props
+                .insert("__deviceId".to_string(), device_id);
+        }
+    }
+
+    pub fn get_device_id(&self) -> Option<String> {
+        self.device_id.clone()
     }
 
     /// Set a custom header for a tracker object.
     /// Use this to set custom headers used for e.g. geo location
-    pub fn with_header(mut self, key: String, value: String) -> TrackerResult<Self> {
-        self.headers
-            .push(&GString::from(format!("{}: {}", key, value).as_str()));
-
-        Ok(self)
+    pub fn set_header(&mut self, key: String, value: String) {
+        self.headers.set(key.as_str(), value.as_str());
     }
 
     /// Set global properties for tracker object. Global properties are added to every
     /// `track` and `identify` event sent.
-    pub fn with_global_properties(mut self, properties: HashMap<String, String>) -> Self {
+    pub fn set_global_properties(&mut self, properties: HashMap<String, String>) {
         self.global_props = properties;
-        self
     }
 
     pub fn force_in_editor(&mut self, force: bool) {
@@ -195,12 +261,11 @@ impl Tracker {
     }
 
     pub fn is_disabled(&self) -> bool {
-        godot_print!("Checking if tracker is disabled: disabled={}, force_in_editor={}, is_editor={}", self.disabled, self.force_in_editor, Os::singleton().has_feature("editor"));
         self.disabled || (Os::singleton().has_feature("editor") && !self.force_in_editor)
     }
 
     pub fn filter(
-        self,
+        &self,
         properties: Option<VarDictionary>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) -> bool {
@@ -223,7 +288,7 @@ impl Tracker {
     ///     be applied onto the payload. If the result is true, the event won't be sent
     pub async fn track(
         &mut self,
-        event: String,
+        event: &str,
         profile_id: Option<String>,
         properties: Option<VarDictionary>,
     ) -> TrackerResult<HttpRequestResult> {
@@ -317,12 +382,8 @@ impl Tracker {
 
         properties.extend(local_props);
 
-        self.track(
-            "revenue".to_string(),
-            profile_id,
-            Some(VarDictionary::from_iter(properties)),
-        )
-        .await
+        self.track("revenue", profile_id, Some(hashmap_to_dict(properties)))
+            .await
     }
 
     pub async fn fetch_device_id(&mut self) -> TrackerResult<String> {
@@ -341,7 +402,11 @@ impl Tracker {
         let err = self
             .http_client
             .request_ex(url.as_str())
-            .custom_headers(&self.headers)
+            .custom_headers(&PackedStringArray::from_iter(
+                self.headers
+                    .iter_shared()
+                    .map(|(k, v)| GString::from(format!("{}: {}", k, v).as_str())),
+            ))
             .done();
 
         if err != Error::OK {
@@ -406,7 +471,11 @@ impl Tracker {
             .http_client
             .request_ex(self.api_url.as_str())
             .request_data(&serde_json::to_string(&payload)?)
-            .custom_headers(&self.headers)
+            .custom_headers(&PackedStringArray::from_iter(
+                self.headers
+                    .iter_shared()
+                    .map(|(k, v)| GString::from(format!("{}: {}", k, v).as_str())),
+            ))
             .method(Method::POST)
             .done();
 
@@ -421,6 +490,18 @@ impl Tracker {
             .request_completed()
             .to_future()
             .await;
+
+        let mut json = Json::new_gd();
+        json.parse(&body.get_string_from_utf8());
+        let json = json.get_data().to::<VarDictionary>();
+        godot_print!("Parsed JSON: {:#?}", json);
+        let device_id = json.get("deviceId").unwrap_or(Variant::nil());
+        godot_print!("Device ID from response: {}", device_id);
+        if !device_id.is_nil()
+            && device_id.to_string() != self.get_device_id().unwrap_or("NO_ID".into())
+        {
+            self.set_device_id(device_id.to_string());
+        }
 
         Ok(HttpRequestResult {
             result: godot::classes::http_request::Result::from_ord(result as i32),

@@ -1,28 +1,79 @@
-use godot::classes::{Os, ProjectSettings};
+use godot::classes::{EditorPlugin, IEditorPlugin, Os, ProjectSettings};
 use godot::prelude::*;
+use godot::tools::{get_autoload_by_name, try_get_autoload_by_name};
 
 use crate::TrackerError;
-use crate::sdk::{Tracker, hashmap_to_dict};
+use crate::tracker::{OpenPanelTracker, hashmap_to_dict};
 use std::collections::HashMap;
 
 #[derive(GodotClass)]
-#[class(init, singleton)]
+#[class(tool, init, base=EditorPlugin)]
+pub struct AnalyticsPlugin {
+    base: Base<EditorPlugin>,
+}
+
+#[godot_api]
+impl IEditorPlugin for AnalyticsPlugin {
+    fn enter_tree(&mut self) {
+        if try_get_autoload_by_name::<OpenPanelTracker>("OpenPanel").is_err() {
+            self.base_mut()
+                .add_autoload_singleton("OpenPanel", "res://addons/OpenPanel/OpenPanel.tscn");
+        }
+    }
+
+    fn exit_tree(&mut self) {
+        self.base_mut().remove_autoload_singleton("OpenPanel");
+    }
+}
+
+#[derive(GodotClass)]
+#[class(singleton)]
 pub struct Analytics {
-    tracker: Option<Tracker>,
+    tracker: Option<Gd<OpenPanelTracker>>,
+    store_session_device: bool,
     force_in_editor: bool,
     disabled: bool,
     base: Base<Object>,
 }
 
 #[godot_api]
+impl IObject for Analytics {
+    fn init(base: Base<Object>) -> Self {
+        Self {
+            tracker: None,
+            store_session_device: true,
+            force_in_editor: false,
+            disabled: false,
+            base,
+        }
+    }
+}
+
+#[godot_api]
 impl Analytics {
-    #[func]
-    pub fn init(&mut self, tree: Gd<SceneTree>, url: String, client_id: String, client_secret: String) {
-        self.base_mut().call_deferred("_init_internal", &[Variant::from(tree), Variant::from(url), Variant::from(client_id), Variant::from(client_secret)]);
+    pub fn tracker(&mut self) -> Gd<OpenPanelTracker> {
+        if self.tracker.is_none() {
+            let tracker = get_autoload_by_name::<OpenPanelTracker>("OpenPanel");
+            self.tracker.replace(tracker.clone());
+        }
+
+        self.tracker.clone().unwrap()
     }
 
     #[func]
-    fn _init_internal(&mut self, tree: Gd<SceneTree>, url: String, client_id: String, client_secret: String) {
+    pub fn connect(&mut self, url: String, client_id: String, client_secret: String) {
+        self.base_mut().call_deferred(
+            "_connect_internal",
+            &[
+                Variant::from(url),
+                Variant::from(client_id),
+                Variant::from(client_secret),
+            ],
+        );
+    }
+
+    #[func]
+    fn _connect_internal(&mut self, url: String, client_id: String, client_secret: String) {
         let mut global_properties = HashMap::new();
         global_properties.insert("os".to_string(), Os::singleton().get_name().to_string());
         global_properties.insert(
@@ -40,62 +91,58 @@ impl Analytics {
             env!("CARGO_PKG_VERSION").to_string(),
         );
 
-        let tracker = Tracker::new(
-            tree,
+        self.tracker().bind_mut().set(
             url,
             client_id,
             client_secret,
-        )
-        .with_default_headers();
-        if tracker.is_err() {
-            godot_error!(
-                "Failed to set default headers for analytics tracker: {}",
-                tracker.err().unwrap()
-            );
-            return;
-        }
+            self.store_session_device,
+            self.force_in_editor,
+            self.disabled,
+        );
 
-        let mut tracker = tracker.unwrap().to_owned();
-        tracker.force_in_editor(self.force_in_editor);
-        tracker.disable(self.disabled);
+        self.tracker()
+            .clone()
+            .bind_mut()
+            .set_global_properties(global_properties);
 
-        self.tracker = Some(tracker.with_global_properties(global_properties));
-        if self.tracker.unwrap().is_disabled() {
+        if self.tracker().bind().is_disabled() {
             if Os::singleton().has_feature("engine") {
-                godot_print!("OpenPanel Analytics are disabled while running in engine\nYou can enable them by calling Analytics.enable() in your code");
+                godot_print!(
+                    "OpenPanel Analytics are disabled while running in engine\nYou can enable them by calling Analytics.force_in_editor() in your code"
+                );
             } else {
                 godot_print!("OpenPanel Analytics are disabled");
             }
         } else {
-            let tracker_clone = self.tracker.unwrap();
+            let tracker = self.tracker().clone();
             godot::task::spawn(async {
-                let (_tracker, success) = Analytics::_init_async(tracker_clone).await;
-                if !success {
+                if !Self::_connect_async(tracker).await {
                     godot_warn!("Failed to initialize analytics");
                 }
             });
         }
     }
 
-    async fn _init_async(mut tracker: Tracker) -> (Tracker, bool) {
-        let result = tracker.track("app_started".to_string(), None, None).await;
+    async fn _connect_async(mut tracker: Gd<OpenPanelTracker>) -> bool {
+        let mut tracker = tracker.bind_mut();
+        let result = tracker.track("app_started", None, None).await;
         if let Ok(response) = result {
             if response.result == godot::classes::http_request::Result::SUCCESS
                 && response.response_code >= 200
                 && response.response_code < 300
             {
                 godot_print!(
-                    "Successfully tracked app start: {}",
-                    response.body.get_string_from_utf8()
+                    "Successfully tracked app start: {:?}",
+                    tracker.get_device_id()
                 );
-                (tracker, true)
+                true
             } else {
                 godot_error!(
                     "Failed to track app start (HTTP {}): {}",
                     response.response_code,
                     response.body.get_string_from_utf8()
                 );
-                (tracker, false)
+                false
             }
         } else {
             match result.err().unwrap() {
@@ -119,25 +166,29 @@ impl Analytics {
                 TrackerError::Disabled => {}
                 TrackerError::Filtered => {}
             };
-            (tracker, false)
+            false
         }
     }
 
     fn _track_event_internal(
         &mut self,
-        event: String,
+        event: &str,
         profile_id: Option<String>,
         properties: Option<VarDictionary>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
-        if self.tracker.is_some() {
-            let mut tracker = self.tracker.clone().unwrap();
-            if !tracker.clone().filter(properties.clone(), filter) {
+        if !self.tracker().bind().is_disabled() {
+            if !self.tracker().bind().filter(properties.clone(), filter) {
                 godot_print!("Analytics event '{}' was filtered out", event);
                 return;
             }
+            let mut tracker = self.tracker().clone();
+            let event = event.to_owned();
             godot::task::spawn(async move {
-                let result = tracker.track(event, profile_id, properties).await;
+                let result = tracker
+                    .bind_mut()
+                    .track(event.as_str(), profile_id, properties)
+                    .await;
                 if let Err(err) = result {
                     match err {
                         TrackerError::NotAuthorized => {
@@ -175,7 +226,7 @@ impl Analytics {
     #[func]
     pub fn force_in_editor(&mut self, force: bool) {
         self.force_in_editor = force;
-        if let Some(tracker) = self.tracker.as_mut() { tracker.force_in_editor(force); }
+        self.tracker().bind_mut().force_in_editor(force);
     }
 
     #[allow(unused)]
@@ -183,40 +234,67 @@ impl Analytics {
     /// Disable sending events to OpenPanel
     pub fn disable(&mut self, disable: bool) {
         self.disabled = disable;
-        if let Some(tracker) = self.tracker.as_mut() { tracker.disable(disable); }
+        self.tracker().bind_mut().disable(disable);
     }
 
     #[allow(unused)]
     #[func]
     pub fn is_disabled(&self) -> bool {
-        if let Some(tracker) = &self.tracker {
-            tracker.is_disabled()
+        if let Some(tracker) = self.tracker.clone() {
+            tracker.bind().is_disabled()
         } else {
-            self.disabled
+            false
         }
     }
-
 
     #[allow(unused)]
     #[func]
     pub fn track_event(&mut self, event: String, properties: Variant) {
-        self._track_event_internal(event, None, if properties != Variant::nil() { Some(properties.to::<VarDictionary>()) } else { None }, None);
+        self._track_event_internal(
+            event.as_str(),
+            None,
+            if properties != Variant::nil() {
+                Some(properties.to::<VarDictionary>())
+            } else {
+                None
+            },
+            None,
+        );
     }
 
     #[allow(unused)]
-    pub fn track_event_with_properties(&mut self, event: String, properties: HashMap<String, String>) {
-        self._track_event_internal(event, None, Some(hashmap_to_dict(properties)), None);
+    pub fn track_event_with_properties(
+        &mut self,
+        event: String,
+        properties: HashMap<String, String>,
+    ) {
+        self._track_event_internal(
+            event.as_str(),
+            None,
+            Some(hashmap_to_dict(properties)),
+            None,
+        );
     }
 
     #[allow(unused)]
     #[func]
     pub fn track_event_bare(&mut self, event: String) {
-        self._track_event_internal(event, None, None, None);
+        self._track_event_internal(event.as_str(), None, None, None);
     }
 
     #[allow(unused)]
-    pub fn track_event_with_profile_id_and_properties(&mut self, event: String, profile_id: String, properties: HashMap<String, String>) {
-        self._track_event_internal(event, Some(profile_id), Some(hashmap_to_dict(properties)), None);
+    pub fn track_event_with_profile_id_and_properties(
+        &mut self,
+        event: String,
+        profile_id: String,
+        properties: HashMap<String, String>,
+    ) {
+        self._track_event_internal(
+            event.as_str(),
+            Some(profile_id),
+            Some(hashmap_to_dict(properties)),
+            None,
+        );
     }
 
     #[allow(unused)]
@@ -228,9 +306,13 @@ impl Analytics {
         properties: Variant,
     ) {
         self._track_event_internal(
-            event,
+            event.as_str(),
             Some(profile_id),
-            if properties != Variant::nil() { Some(properties.to::<VarDictionary>()) } else { None },
+            if properties != Variant::nil() {
+                Some(properties.to::<VarDictionary>())
+            } else {
+                None
+            },
             None,
         );
     }
@@ -242,7 +324,12 @@ impl Analytics {
         properties: Option<HashMap<String, String>>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
-        self._track_event_internal(event, None, properties.map(|p| hashmap_to_dict(p)), filter);
+        self._track_event_internal(
+            event.as_str(),
+            None,
+            properties.map(|p| hashmap_to_dict(p)),
+            filter,
+        );
     }
 
     #[allow(unused)]
@@ -254,7 +341,7 @@ impl Analytics {
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
         self._track_event_internal(
-            event,
+            event.as_str(),
             profile_id,
             properties.map(|p| hashmap_to_dict(p)),
             filter,

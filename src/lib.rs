@@ -1,8 +1,8 @@
+mod analytics;
+pub mod tracker;
 /// OpenPanel SDK for tracking events
 mod user;
-pub mod sdk;
-mod analytics;
-pub use crate::{user::IdentifyUser, analytics::Analytics};
+pub use crate::{analytics::Analytics, user::IdentifyUser};
 
 /// Result type for SDK functions
 pub type TrackerResult<T> = Result<T, TrackerError>;
