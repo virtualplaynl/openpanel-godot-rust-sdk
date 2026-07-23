@@ -1,9 +1,10 @@
-use godot::classes::{EditorPlugin, IEditorPlugin, Os, ProjectSettings};
+use godot::classes::{EditorPlugin, Engine, IEditorPlugin, Os, ProjectSettings};
+use godot::obj::{BaseRef, WithSignals};
 use godot::prelude::*;
-use godot::tools::{get_autoload_by_name, try_get_autoload_by_name};
 
 use crate::TrackerError;
 use crate::tracker::{OpenPanelTracker, hashmap_to_dict};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[derive(GodotClass)]
@@ -15,7 +16,14 @@ pub struct AnalyticsPlugin {
 #[godot_api]
 impl IEditorPlugin for AnalyticsPlugin {
     fn enter_tree(&mut self) {
-        if try_get_autoload_by_name::<OpenPanelTracker>("OpenPanel").is_err() {
+        if self
+            .base()
+            .get_tree()
+            .get_root()
+            .unwrap()
+            .find_child("OpenPanel")
+            .is_none()
+        {
             self.base_mut()
                 .add_autoload_singleton("OpenPanel", "res://addons/OpenPanel/OpenPanel.tscn");
         }
@@ -26,54 +34,98 @@ impl IEditorPlugin for AnalyticsPlugin {
     }
 }
 
+thread_local! {
+    static INSTANCE: RefCell<Option<Gd<Analytics>>> = RefCell::new(None);
+}
+
 #[derive(GodotClass)]
-#[class(singleton)]
+#[class(init, base=Object)]
 pub struct Analytics {
     tracker: Option<Gd<OpenPanelTracker>>,
+    device_id: Variant,
     store_session_device: bool,
     force_in_editor: bool,
     disabled: bool,
     base: Base<Object>,
 }
 
-#[godot_api]
-impl IObject for Analytics {
-    fn init(base: Base<Object>) -> Self {
-        Self {
-            tracker: None,
-            store_session_device: true,
-            force_in_editor: false,
-            disabled: false,
-            base,
-        }
-    }
+pub fn get_autoload<T: GodotClass + Inherits<Node>>(name: &str) -> Option<Gd<T>> {
+    Engine::singleton()
+        .get_main_loop()?
+        .cast::<SceneTree>()
+        .get_root()?
+        .try_get_node_as::<T>(format!("/root/{}", name).as_str())
 }
 
 #[godot_api]
 impl Analytics {
-    pub fn tracker(&mut self) -> Gd<OpenPanelTracker> {
+    #[func]
+    pub fn with_tracker(
+        tracker: Gd<OpenPanelTracker>,
+        store_session_device: bool,
+        force_in_editor: bool,
+        disabled: bool,
+    ) -> Gd<Self> {
+        godot_print!("Setting Analytics tracker");
+
+        Gd::from_init_fn(|base| {
+            // Accept a base of type Base<Node3D> and directly forward it.
+            Self {
+                tracker: Some(tracker),
+                device_id: Variant::nil(),
+                store_session_device,
+                force_in_editor,
+                disabled,
+                base,
+            }
+        })
+    }
+
+    pub fn tracker(&mut self) -> Option<Gd<OpenPanelTracker>> {
         if self.tracker.is_none() {
-            let tracker = get_autoload_by_name::<OpenPanelTracker>("OpenPanel");
-            self.tracker.replace(tracker.clone());
+            let tracker = get_autoload::<OpenPanelTracker>("OpenPanel");
+            self.tracker.replace(tracker.unwrap().clone());
         }
 
-        self.tracker.clone().unwrap()
+        self.tracker.clone()
+    }
+
+    pub fn clear_tracker(tracker: Gd<OpenPanelTracker>) {
+        Self::with_instance(|analytics| {
+            if let Some(current) = analytics.tracker.clone() {
+                if current.instance_id() == tracker.instance_id() {
+                    analytics.tracker = None;
+                }
+            }
+        });
+    }
+
+    fn with_instance<F, R>(mut f: F) -> Option<R>
+    where
+        F: FnMut(&mut Analytics) -> R,
+    {
+        INSTANCE.with(|cell| {
+            let mut gd = cell.borrow().clone()?;
+            let mut guard = gd.bind_mut();
+            Some(f(&mut guard))
+        })
+    }
+
+    pub fn store(&mut self) {
+        INSTANCE.with(|cell| cell.replace(Some(self.to_gd().clone())));
     }
 
     #[func]
-    pub fn connect(&mut self, url: String, client_id: String, client_secret: String) {
-        self.base_mut().call_deferred(
-            "_connect_internal",
-            &[
-                Variant::from(url),
-                Variant::from(client_id),
-                Variant::from(client_secret),
-            ],
-        );
+    pub fn connect(url: String, client_id: String, client_secret: String) {
+        _ = Self::with_instance(|analytics| {
+            analytics._connect(url.clone(), client_id.clone(), client_secret.clone());
+        });
     }
 
     #[func]
-    fn _connect_internal(&mut self, url: String, client_id: String, client_secret: String) {
+    fn _connect(&mut self, url: String, client_id: String, client_secret: String) {
+        self.disabled = false;
+
         let mut global_properties = HashMap::new();
         global_properties.insert("os".to_string(), Os::singleton().get_name().to_string());
         global_properties.insert(
@@ -91,35 +143,42 @@ impl Analytics {
             env!("CARGO_PKG_VERSION").to_string(),
         );
 
-        self.tracker().bind_mut().set(
-            url,
-            client_id,
-            client_secret,
-            self.store_session_device,
-            self.force_in_editor,
-            self.disabled,
-        );
+        if let Some(mut tracker) = self.tracker() {
+            tracker.bind_mut().set(
+                url,
+                client_id,
+                client_secret,
+                self.store_session_device,
+                self.force_in_editor,
+                self.disabled,
+            );
 
-        self.tracker()
-            .clone()
-            .bind_mut()
-            .set_global_properties(global_properties);
+            tracker
+                .clone()
+                .bind_mut()
+                .set_global_properties(global_properties);
 
-        if self.tracker().bind().is_disabled() {
-            if Os::singleton().has_feature("engine") {
-                godot_print!(
-                    "OpenPanel Analytics are disabled while running in engine\nYou can enable them by calling Analytics.force_in_editor() in your code"
-                );
+            if tracker.bind().is_disabled() {
+                if Os::singleton().has_feature("engine") {
+                    godot_print!(
+                        "OpenPanel Analytics are disabled while running in engine\nYou can enable them by calling Analytics.force_in_editor() in your code"
+                    );
+                } else {
+                    godot_print!("OpenPanel Analytics are disabled");
+                }
             } else {
-                godot_print!("OpenPanel Analytics are disabled");
+                let tracker = tracker.clone();
+                godot::task::spawn(async {
+                    if !Self::_connect_async(tracker).await {
+                        godot_warn!("Failed to initialize analytics");
+                    }
+                });
             }
         } else {
-            let tracker = self.tracker().clone();
-            godot::task::spawn(async {
-                if !Self::_connect_async(tracker).await {
-                    godot_warn!("Failed to initialize analytics");
-                }
-            });
+            godot_error!(
+                "Analytics tracker not found. Please check if the OpenPanel autoload was removed from Project Settings."
+            );
+            return;
         }
     }
 
@@ -131,10 +190,6 @@ impl Analytics {
                 && response.response_code >= 200
                 && response.response_code < 300
             {
-                godot_print!(
-                    "Successfully tracked app start: {:?}",
-                    tracker.get_device_id()
-                );
                 true
             } else {
                 godot_error!(
@@ -170,22 +225,53 @@ impl Analytics {
         }
     }
 
+    pub fn set_device_id(device_id: &String) {
+        Self::with_instance(|analytics| {
+            analytics.device_id = Variant::from(device_id.as_str());
+            analytics
+                .signals()
+                .device_id_updated()
+                .emit(device_id.to_owned());
+        });
+    }
+
+    #[signal]
+    fn device_id_updated(new_device_id: String);
+
+    pub fn connect_device_id_updated(node_ref: BaseRef<'_, impl WithSignals>, func: &str) {
+        _ = Self::with_instance(move |analytics| {
+            let callable = node_ref.callable(func);
+            analytics.base_mut().connect("device_id_updated", &callable)
+        });
+    }
+
+    #[allow(unused)]
+    #[func]
+    pub fn get_device_id() -> Variant {
+        Self::with_instance(|analytics| analytics.device_id.clone()).unwrap_or_default()
+    }
+
     fn _track_event_internal(
         &mut self,
         event: &str,
         profile_id: Option<String>,
-        properties: Option<VarDictionary>,
+        properties: Option<Dictionary<GString, GString>>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
-        if !self.tracker().bind().is_disabled() {
-            if !self.tracker().bind().filter(properties.clone(), filter) {
+        if let Some(tracker) = self.tracker() {
+            if tracker.bind().is_disabled() {
+                return;
+            }
+            if !tracker.bind().filter(properties.clone(), filter) {
                 godot_print!("Analytics event '{}' was filtered out", event);
                 return;
             }
-            let mut tracker = self.tracker().clone();
+
+            let tracker = tracker.clone();
             let event = event.to_owned();
             godot::task::spawn(async move {
                 let result = tracker
+                    .clone()
                     .bind_mut()
                     .track(event.as_str(), profile_id, properties)
                     .await;
@@ -224,22 +310,40 @@ impl Analytics {
 
     #[allow(unused)]
     #[func]
-    pub fn force_in_editor(&mut self, force: bool) {
+    /// Force enable analytics while running in the editor (for testing)
+    pub fn force_in_editor(force: bool) {
+        _ = Self::with_instance(|analytics| {
+            analytics._force_in_editor(force);
+        });
+    }
+    pub fn _force_in_editor(&mut self, force: bool) {
         self.force_in_editor = force;
-        self.tracker().bind_mut().force_in_editor(force);
+        if let Some(mut tracker) = self.tracker() {
+            tracker.bind_mut().force_in_editor(force);
+        }
     }
 
     #[allow(unused)]
     #[func]
     /// Disable sending events to OpenPanel
-    pub fn disable(&mut self, disable: bool) {
+    pub fn disable(disable: bool) {
+        _ = Self::with_instance(|analytics| {
+            analytics._disable(disable);
+        });
+    }
+    pub fn _disable(&mut self, disable: bool) {
         self.disabled = disable;
-        self.tracker().bind_mut().disable(disable);
+        if let Some(mut tracker) = self.tracker() {
+            tracker.bind_mut().disable(disable);
+        }
     }
 
     #[allow(unused)]
     #[func]
-    pub fn is_disabled(&self) -> bool {
+    pub fn is_disabled() -> bool {
+        Self::with_instance(|analytics| analytics._is_disabled()).unwrap_or(false)
+    }
+    pub fn _is_disabled(&mut self) -> bool {
         if let Some(tracker) = self.tracker.clone() {
             tracker.bind().is_disabled()
         } else {
@@ -249,17 +353,19 @@ impl Analytics {
 
     #[allow(unused)]
     #[func]
-    pub fn track_event(&mut self, event: String, properties: Variant) {
-        self._track_event_internal(
-            event.as_str(),
-            None,
-            if properties != Variant::nil() {
-                Some(properties.to::<VarDictionary>())
-            } else {
-                None
-            },
-            None,
-        );
+    pub fn track_event(event: String, properties: Variant) {
+        _ = Self::with_instance(|analytics| {
+            analytics._track_event_internal(
+                event.as_str(),
+                None,
+                if properties != Variant::nil() {
+                    Some(properties.to::<Dictionary<GString, GString>>())
+                } else {
+                    None
+                },
+                None,
+            );
+        });
     }
 
     #[allow(unused)]
@@ -309,7 +415,7 @@ impl Analytics {
             event.as_str(),
             Some(profile_id),
             if properties != Variant::nil() {
-                Some(properties.to::<VarDictionary>())
+                Some(properties.to::<Dictionary<GString, GString>>())
             } else {
                 None
             },
