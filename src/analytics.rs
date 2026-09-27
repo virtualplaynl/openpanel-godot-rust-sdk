@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use godot::classes::{EditorPlugin, Engine, IEditorPlugin, Os, ProjectSettings};
 use godot::obj::{BaseRef, WithSignals};
 use godot::prelude::*;
@@ -245,7 +247,6 @@ impl Analytics {
         });
     }
 
-    #[allow(unused)]
     #[func]
     pub fn get_device_id() -> Variant {
         Self::with_instance(|analytics| analytics.device_id.clone()).unwrap_or_default()
@@ -308,7 +309,6 @@ impl Analytics {
         }
     }
 
-    #[allow(unused)]
     #[func]
     /// Force enable analytics while running in the editor (for testing)
     pub fn force_in_editor(force: bool) {
@@ -323,7 +323,6 @@ impl Analytics {
         }
     }
 
-    #[allow(unused)]
     #[func]
     /// Disable sending events to OpenPanel
     pub fn disable(disable: bool) {
@@ -338,7 +337,6 @@ impl Analytics {
         }
     }
 
-    #[allow(unused)]
     #[func]
     pub fn is_disabled() -> bool {
         Self::with_instance(|analytics| analytics._is_disabled()).unwrap_or(false)
@@ -351,12 +349,15 @@ impl Analytics {
         }
     }
 
-    #[allow(unused)]
     #[func]
-    pub fn track_event(event: String, properties: Variant) {
+    pub fn track_event(event: GString, properties: Variant) {
+        Self::track(&event.to_string(), properties);
+    }
+
+    pub fn track(event: &str, properties: Variant) {
         _ = Self::with_instance(|analytics| {
             analytics._track_event_internal(
-                event.as_str(),
+                event,
                 None,
                 if properties != Variant::nil() {
                     Some(properties.to::<Dictionary<GString, GString>>())
@@ -368,27 +369,19 @@ impl Analytics {
         });
     }
 
-    #[allow(unused)]
     pub fn track_event_with_properties(
         &mut self,
-        event: String,
+        event: &str,
         properties: HashMap<String, String>,
     ) {
-        self._track_event_internal(
-            event.as_str(),
-            None,
-            Some(hashmap_to_dict(properties)),
-            None,
-        );
+        self._track_event_internal(event, None, Some(hashmap_to_dict(properties)), None);
     }
 
-    #[allow(unused)]
     #[func]
     pub fn track_event_bare(&mut self, event: String) {
         self._track_event_internal(event.as_str(), None, None, None);
     }
 
-    #[allow(unused)]
     pub fn track_event_with_profile_id_and_properties(
         &mut self,
         event: String,
@@ -403,7 +396,6 @@ impl Analytics {
         );
     }
 
-    #[allow(unused)]
     #[func]
     pub fn track_event_with_profile_id(
         &mut self,
@@ -423,7 +415,6 @@ impl Analytics {
         );
     }
 
-    #[allow(unused)]
     pub fn track_event_with_filter(
         &mut self,
         event: String,
@@ -438,7 +429,6 @@ impl Analytics {
         );
     }
 
-    #[allow(unused)]
     pub fn track_event_with_profile_id_and_filter(
         &mut self,
         event: String,
