@@ -22,7 +22,6 @@ impl IEditorPlugin for AnalyticsPlugin {
             .base()
             .get_tree()
             .get_root()
-            .unwrap()
             .find_child("OpenPanel")
             .is_none()
         {
@@ -55,8 +54,27 @@ pub fn get_autoload<T: GodotClass + Inherits<Node>>(name: &str) -> Option<Gd<T>>
     Engine::singleton()
         .get_main_loop()?
         .cast::<SceneTree>()
-        .get_root()?
+        .get_root()
         .try_get_node_as::<T>(format!("/root/{}", name).as_str())
+}
+pub fn try_to_string_dict(var_dict: &Variant) -> Option<Dictionary<GString, GString>> {
+    let mut success = true;
+    if let Ok(dict) = var_dict.try_to::<Dictionary<Variant, Variant>>() {
+        let result = dict
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if let (Ok(k), Ok(v)) = (k.try_to::<GString>(), v.try_to::<GString>()) {
+                    Some((k, v))
+                } else {
+                    success = false;
+                    None
+                }
+            })
+            .collect::<Dictionary<GString, GString>>();
+        if success { Some(result) } else { None }
+    } else {
+        None
+    }
 }
 
 #[godot_api]
@@ -118,14 +136,14 @@ impl Analytics {
     }
 
     #[func]
-    pub fn connect(url: String, client_id: String, client_secret: String) {
+    pub fn openpanel_connect(url: String, client_id: String, client_secret: String) {
         _ = Self::with_instance(|analytics| {
-            analytics._connect(url.clone(), client_id.clone(), client_secret.clone());
+            analytics._openpanel_connect(url.clone(), client_id.clone(), client_secret.clone());
         });
     }
 
     #[func]
-    fn _connect(&mut self, url: String, client_id: String, client_secret: String) {
+    fn _openpanel_connect(&mut self, url: String, client_id: String, client_secret: String) {
         self.disabled = false;
 
         let mut global_properties = HashMap::new();
@@ -184,9 +202,8 @@ impl Analytics {
         }
     }
 
-    async fn _connect_async(mut tracker: Gd<OpenPanelTracker>) -> bool {
-        let mut tracker = tracker.bind_mut();
-        let result = tracker.track("app_started", None, None).await;
+    async fn _connect_async(tracker: Gd<OpenPanelTracker>) -> bool {
+        let result = OpenPanelTracker::track(tracker, "app_started", None, None).await;
         if let Ok(response) = result {
             if response.result == godot::classes::http_request::Result::SUCCESS
                 && response.response_code >= 200
@@ -204,21 +221,25 @@ impl Analytics {
         } else {
             match result.err().unwrap() {
                 TrackerError::NotAuthorized => {
-                    godot_error!("Analytics tracking failed: Not Authorized")
+                    godot_error!("Analytics tracking failed: Not Authorized");
                 }
                 TrackerError::TooManyRequests => {
-                    godot_error!("Analytics tracking failed: Too Many Requests")
+                    godot_error!("Analytics tracking failed: Too Many Requests");
                 }
-                TrackerError::Internal => godot_error!("Analytics tracking failed: Internal Error"),
-                TrackerError::Request => godot_error!("Analytics tracking failed: Request Error"),
+                TrackerError::Internal => {
+                    godot_error!("Analytics tracking failed: Internal Error");
+                }
+                TrackerError::Request => {
+                    godot_error!("Analytics tracking failed: Request Error");
+                }
                 TrackerError::Serializing(error) => {
-                    godot_error!("Analytics tracking failed: Serializing Error: {}", error)
+                    godot_error!("Analytics tracking failed: Serializing Error: {}", error);
                 }
                 TrackerError::HeaderName => {
-                    godot_error!("Analytics tracking failed: Invalid Header Name")
+                    godot_error!("Analytics tracking failed: Invalid Header Name");
                 }
                 TrackerError::HeaderValue => {
-                    godot_error!("Analytics tracking failed: Invalid Header Value")
+                    godot_error!("Analytics tracking failed: Invalid Header Value");
                 }
                 TrackerError::Disabled => {}
                 TrackerError::Filtered => {}
@@ -268,14 +289,11 @@ impl Analytics {
                 return;
             }
 
-            let tracker = tracker.clone();
+            let tracker = tracker.to_godot_owned();
             let event = event.to_owned();
             godot::task::spawn(async move {
-                let result = tracker
-                    .clone()
-                    .bind_mut()
-                    .track(event.as_str(), profile_id, properties)
-                    .await;
+                let result =
+                    OpenPanelTracker::track(tracker, event.as_str(), profile_id, properties).await;
                 if let Err(err) = result {
                     match err {
                         TrackerError::NotAuthorized => {
@@ -356,16 +374,7 @@ impl Analytics {
 
     pub fn track(event: &str, properties: Variant) {
         _ = Self::with_instance(|analytics| {
-            analytics._track_event_internal(
-                event,
-                None,
-                if properties != Variant::nil() {
-                    Some(properties.to::<Dictionary<GString, GString>>())
-                } else {
-                    None
-                },
-                None,
-            );
+            analytics._track_event_internal(event, None, try_to_string_dict(&properties), None);
         });
     }
 
@@ -406,11 +415,7 @@ impl Analytics {
         self._track_event_internal(
             event.as_str(),
             Some(profile_id),
-            if properties != Variant::nil() {
-                Some(properties.to::<Dictionary<GString, GString>>())
-            } else {
-                None
-            },
+            try_to_string_dict(&properties),
             None,
         );
     }
