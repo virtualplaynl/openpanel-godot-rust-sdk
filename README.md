@@ -9,9 +9,36 @@
 
 ## Usage
 
+### Quick Godot based example
+
+Initialization
+
+```rust
+let url = obfuscate!("https://api.openpanel.dev/track").to_string();
+let client_id = obfuscate!("<YOUR_CLIENT_ID>").to_string();
+let client_secret = obfuscate!("<YOUR_CLIENT_SECRET>").to_string();
+
+Analytics::connect_device_id_updated(self.base(), "on_device_id_updated");
+
+Analytics::force_in_editor(true);
+Analytics::openpanel_connect(url, client_id, client_secret);
+```
+
+Tracking event
+
+```rust
+Analytics::track_event(
+    "game_finished".into(),
+    Variant::from(vdict! {
+        "score" => self.score,
+        "coins" => self.coins,
+        "time" => self.time
+    }),
+);
+```
+
 > [!CAUTION]
-> This documentation is not updated for this Godot version yet. Do not use like this!
-> As of the time of writing, only up to godot-rust 0.3.5 is tested.
+> Everything below is not documentation for the Godot version. Do not use like this!
 
 Set your env vars in `.env` file:
 
