@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-use godot::classes::{EditorPlugin, Engine, IEditorPlugin, Os, ProjectSettings};
+use godot::classes::{EditorPlugin, IEditorPlugin, Os, ProjectSettings};
 use godot::obj::{BaseRef, WithSignals};
 use godot::prelude::*;
+use godot::tools::try_get_autoload_by_name;
 
-use crate::TrackerError;
 use crate::tracker::{OpenPanelTracker, hashmap_to_dict};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,13 +50,6 @@ pub struct Analytics {
     base: Base<Object>,
 }
 
-pub fn get_autoload<T: GodotClass + Inherits<Node>>(name: &str) -> Option<Gd<T>> {
-    Engine::singleton()
-        .get_main_loop()?
-        .cast::<SceneTree>()
-        .get_root()
-        .try_get_node_as::<T>(format!("/root/{}", name).as_str())
-}
 pub fn try_to_string_dict(var_dict: &Variant) -> Option<Dictionary<GString, GString>> {
     let mut success = true;
     if let Ok(dict) = var_dict.try_to::<Dictionary<Variant, Variant>>() {
@@ -103,8 +96,14 @@ impl Analytics {
 
     pub fn tracker(&mut self) -> Option<Gd<OpenPanelTracker>> {
         if self.tracker.is_none() {
-            let tracker = get_autoload::<OpenPanelTracker>("OpenPanel");
-            self.tracker.replace(tracker.unwrap().clone());
+            let tracker = try_get_autoload_by_name::<OpenPanelTracker>("OpenPanel");
+            if let Ok(tracker) = tracker {
+                self.tracker.replace(tracker.clone());
+            } else {
+                godot_error!(
+                    "Analytics tracker not found. Please check if the OpenPanel autoload was removed from Project Settings."
+                );
+            }
         }
 
         self.tracker.clone()
@@ -187,64 +186,13 @@ impl Analytics {
                     godot_print!("OpenPanel Analytics are disabled");
                 }
             } else {
-                let tracker = tracker.clone();
-                godot::task::spawn(async {
-                    if !Self::_connect_async(tracker).await {
-                        godot_warn!("Failed to initialize analytics");
-                    }
-                });
+                tracker.bind_mut().track("app_started", None, None);
             }
         } else {
             godot_error!(
                 "Analytics tracker not found. Please check if the OpenPanel autoload was removed from Project Settings."
             );
             return;
-        }
-    }
-
-    async fn _connect_async(tracker: Gd<OpenPanelTracker>) -> bool {
-        let result = OpenPanelTracker::track(tracker, "app_started", None, None).await;
-        if let Ok(response) = result {
-            if response.result == godot::classes::http_request::Result::SUCCESS
-                && response.response_code >= 200
-                && response.response_code < 300
-            {
-                true
-            } else {
-                godot_error!(
-                    "Failed to track app start (HTTP {}): {}",
-                    response.response_code,
-                    response.body.get_string_from_utf8()
-                );
-                false
-            }
-        } else {
-            match result.err().unwrap() {
-                TrackerError::NotAuthorized => {
-                    godot_error!("Analytics tracking failed: Not Authorized");
-                }
-                TrackerError::TooManyRequests => {
-                    godot_error!("Analytics tracking failed: Too Many Requests");
-                }
-                TrackerError::Internal => {
-                    godot_error!("Analytics tracking failed: Internal Error");
-                }
-                TrackerError::Request => {
-                    godot_error!("Analytics tracking failed: Request Error");
-                }
-                TrackerError::Serializing(error) => {
-                    godot_error!("Analytics tracking failed: Serializing Error: {}", error);
-                }
-                TrackerError::HeaderName => {
-                    godot_error!("Analytics tracking failed: Invalid Header Name");
-                }
-                TrackerError::HeaderValue => {
-                    godot_error!("Analytics tracking failed: Invalid Header Value");
-                }
-                TrackerError::Disabled => {}
-                TrackerError::Filtered => {}
-            };
-            false
         }
     }
 
@@ -289,38 +237,12 @@ impl Analytics {
                 return;
             }
 
-            let tracker = tracker.to_godot_owned();
+            let mut tracker = tracker.to_godot_owned();
             let event = event.to_owned();
             godot::task::spawn(async move {
-                let result =
-                    OpenPanelTracker::track(tracker, event.as_str(), profile_id, properties).await;
-                if let Err(err) = result {
-                    match err {
-                        TrackerError::NotAuthorized => {
-                            godot_error!("Analytics tracking failed: Not Authorized");
-                        }
-                        TrackerError::TooManyRequests => {
-                            godot_error!("Analytics tracking failed: Too Many Requests");
-                        }
-                        TrackerError::Internal => {
-                            godot_error!("Analytics tracking failed: Internal Error");
-                        }
-                        TrackerError::Request => {
-                            godot_error!("Analytics tracking failed: Request Error");
-                        }
-                        TrackerError::Serializing(e) => {
-                            godot_error!("Analytics tracking failed: Serializing Error: {}", e);
-                        }
-                        TrackerError::HeaderName => {
-                            godot_error!("Analytics tracking failed: Invalid Header Name");
-                        }
-                        TrackerError::HeaderValue => {
-                            godot_error!("Analytics tracking failed: Invalid Header Value");
-                        }
-                        TrackerError::Disabled => {}
-                        TrackerError::Filtered => {}
-                    }
-                }
+                tracker
+                    .bind_mut()
+                    .track(event.as_str(), profile_id, properties);
             });
         } else {
             godot_error!("Analytics tracker not initialized");

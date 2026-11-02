@@ -47,8 +47,9 @@ use godot::classes::{ConfigFile, Engine, HttpRequest, Json, Os};
 use godot::global::Error;
 use godot::prelude::*;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+use std::thread::sleep;
 
 const DEBUG: bool = true;
 
@@ -139,6 +140,8 @@ pub struct OpenPanelTracker {
     store_session_device: bool,
     force_in_editor: bool,
     disabled: bool,
+    busy: bool,
+    send_queue: VecDeque<serde_json::Value>,
     base: Base<Node>,
 }
 
@@ -158,6 +161,11 @@ impl INode for OpenPanelTracker {
         let force_in_editor = self.force_in_editor;
         let disabled = self.disabled;
 
+        http_client
+            .signals()
+            .request_completed()
+            .connect_other(self, Self::on_request_completed);
+
         let mut base = self.base_mut();
         base.add_child(&http_client);
 
@@ -168,6 +176,21 @@ impl INode for OpenPanelTracker {
             disabled,
         );
         analytics.bind_mut().store();
+    }
+
+    fn process(&mut self, _delta: f64) {
+        if self.busy {
+            return;
+        }
+
+        if let Some(payload) = self.send_queue.pop_front() {
+            godot_print!(
+                "Sending payload: {}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+            self.busy = true;
+            self.send_request(payload);
+        }
     }
 
     fn exit_tree(&mut self) {
@@ -214,6 +237,8 @@ impl OpenPanelTracker {
             store_session_device: store_session_device,
             force_in_editor,
             disabled,
+            busy: false,
+            send_queue: VecDeque::new(),
             base,
         }
     }
@@ -307,19 +332,17 @@ impl OpenPanelTracker {
     /// # Parameters:
     /// - event [String]: The event name
     /// - properties [Option<HashMap<String, String>>]: Additional properties to send with the event
-    /// - filter [Option<&dyn Fn(HashMap<String, String>) -> bool>]: If provided, the filter fn will
-    ///     be applied onto the payload. If the result is true, the event won't be sent
-    pub async fn track(
-        mut this: Gd<Self>,
+    /// - callback [Option<&dyn Fn(HttpRequestResult) -> bool>]: If provided, the callback fn will
+    ///     be called with the result of the request. If the result is true, the event will be considered successful
+    pub fn track(
+        &mut self,
         event: &str,
         profile_id: Option<String>,
         properties: Option<Dictionary<GString, GString>>,
-    ) -> TrackerResult<HttpRequestResult> {
+    ) {
         let properties_map = properties.map(|p| dict_to_hashmap(p));
 
-        let properties = this
-            .bind_mut()
-            .create_properties_with_globals(properties_map);
+        let properties = self.create_properties_with_globals(properties_map);
         let payload = if profile_id.is_some() {
             serde_json::json!({
                 "type": TrackType::Track,
@@ -339,42 +362,11 @@ impl OpenPanelTracker {
             })
         };
 
-        let result = Self::send_request(this, payload).await;
-        if let Err(ref err) = result {
-            match err {
-                TrackerError::NotAuthorized => {
-                    godot_error!("Analytics tracking failed: Not Authorized");
-                }
-                TrackerError::TooManyRequests => {
-                    godot_error!("Analytics tracking failed: Too Many Requests");
-                }
-                TrackerError::Internal => {
-                    godot_error!("Analytics tracking failed: Internal Error");
-                }
-                TrackerError::Request => {
-                    godot_error!("Analytics tracking failed: Request Error");
-                }
-                TrackerError::Serializing(e) => {
-                    godot_error!("Analytics tracking failed: Serializing Error: {}", e);
-                }
-                TrackerError::HeaderName => {
-                    godot_error!("Analytics tracking failed: Invalid Header Name");
-                }
-                TrackerError::HeaderValue => {
-                    godot_error!("Analytics tracking failed: Invalid Header Value");
-                }
-                TrackerError::Disabled => {}
-                TrackerError::Filtered => {}
-            }
-        }
-        result
+        self.queue_request(payload);
     }
 
     /// Identify user on OpenPanel
-    pub async fn identify(
-        &mut self,
-        mut user: user::IdentifyUser,
-    ) -> TrackerResult<HttpRequestResult> {
+    pub fn identify(&mut self, mut user: user::IdentifyUser) {
         user.properties = self.create_properties_with_globals(Some(user.properties));
 
         let payload = serde_json::json!({
@@ -382,16 +374,11 @@ impl OpenPanelTracker {
           "payload": user
         });
 
-        Self::send_request(self.to_gd(), payload).await
+        self.queue_request(payload);
     }
 
     /// Decrement property value on OpenPanel
-    pub async fn decrement(
-        &mut self,
-        profile_id: String,
-        property: String,
-        value: i64,
-    ) -> TrackerResult<HttpRequestResult> {
+    pub fn decrement(&mut self, profile_id: String, property: String, value: i64) {
         let payload = serde_json::json!({
           "type": TrackType::Decrement,
           "payload": {
@@ -401,16 +388,11 @@ impl OpenPanelTracker {
           }
         });
 
-        Self::send_request(self.to_gd(), payload).await
+        self.queue_request(payload);
     }
 
     /// Decrement property value on OpenPanel
-    pub async fn increment(
-        &mut self,
-        profile_id: String,
-        property: String,
-        value: i64,
-    ) -> TrackerResult<HttpRequestResult> {
+    pub fn increment(&mut self, profile_id: String, property: String, value: i64) {
         let payload = serde_json::json!({
           "type": TrackType::Increment,
           "payload": {
@@ -420,29 +402,22 @@ impl OpenPanelTracker {
           }
         });
 
-        Self::send_request(self.to_gd(), payload).await
+        self.queue_request(payload);
     }
 
-    pub async fn revenue(
+    pub fn revenue(
         &mut self,
         profile_id: Option<String>,
         amount: i64,
         properties: Option<Dictionary<GString, GString>>,
-    ) -> TrackerResult<HttpRequestResult> {
+    ) {
         let local_props = HashMap::from([("__revenue".to_string(), amount.to_string())]);
         let mut properties =
             self.create_properties_with_globals(properties.map(|p| dict_to_hashmap(p)));
 
         properties.extend(local_props);
 
-        let this = self.to_gd();
-        Self::track(
-            this,
-            "revenue",
-            profile_id,
-            Some(hashmap_to_dict(properties)),
-        )
-        .await
+        self.track("revenue", profile_id, Some(hashmap_to_dict(properties)));
     }
 
     pub async fn fetch_device_id(&mut self) -> TrackerResult<String> {
@@ -506,67 +481,88 @@ impl OpenPanelTracker {
         }
     }
 
+    fn queue_request(&mut self, payload: serde_json::Value) {
+        self.send_queue.push_back(payload);
+    }
+
     /// Actually send the request to the API
-    async fn send_request(
-        mut this: Gd<Self>,
-        payload: serde_json::Value,
-    ) -> TrackerResult<HttpRequestResult> {
-        let mut client = this.bind_mut().http_client.clone();
+    fn send_request(&mut self, payload: serde_json::Value) {
+        let mut client = self.http_client.clone();
 
-        {
-            let _self = this.bind();
-            if _self.disabled {
-                return Err(TrackerError::Disabled);
-            }
-
-            if Os::singleton().has_feature("editor") && !_self.force_in_editor {
-                return Err(TrackerError::Disabled);
-            }
-            if Os::singleton().is_debug_build() && DEBUG {
-                godot_print!("Sending request to {}", _self.api_url);
-                godot_print!(
-                    "Sending payload:\n{}",
-                    serde_json::to_string_pretty(&payload)?
-                );
-            }
-
-            let api_url = _self.api_url.as_str();
-
-            let err = client
-                .request_ex(api_url)
-                .request_data(&serde_json::to_string(&payload)?)
-                .custom_headers(&PackedStringArray::from_iter(
-                    _self
-                        .headers
-                        .iter_shared()
-                        .map(|(k, v)| GString::from(format!("{}: {}", k, v).as_str())),
-                ))
-                .method(Method::POST)
-                .done();
-
-            if err != Error::OK {
-                godot_error!("Failed to send request: {:?}", err);
-                return Err(TrackerError::Request);
-            }
+        if self.disabled {
+            return;
         }
 
-        let (result, response_code, headers, body) =
-            client.signals().request_completed().to_future().await;
+        if Os::singleton().has_feature("editor") && !self.force_in_editor {
+            return;
+        }
+
+        while self.busy {
+            godot_print!("Waiting for previous request to complete...");
+            sleep(std::time::Duration::from_millis(100));
+        }
+
+        self.busy = true;
+
+        if Os::singleton().is_debug_build() && DEBUG {
+            godot_print!("Sending request to {}", self.api_url);
+            godot_print!(
+                "Sending payload:\n{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+        }
+
+        let api_url = self.api_url.as_str();
+
+        let err = client
+            .request_ex(api_url)
+            .request_data(&serde_json::to_string(&payload).unwrap_or_default())
+            .custom_headers(&PackedStringArray::from_iter(
+                self.headers
+                    .iter_shared()
+                    .map(|(k, v)| GString::from(format!("{}: {}", k, v).as_str())),
+            ))
+            .method(Method::POST)
+            .done();
+
+        if err != Error::OK {
+            godot_error!("Failed to send request: {:?}", err);
+            self.busy = false;
+            return;
+        }
+    }
+
+    fn on_request_completed(
+        &mut self,
+        result: i64,
+        response_code: i64,
+        headers: PackedStringArray,
+        body: PackedByteArray,
+    ) {
+        if result != godot::classes::http_request::Result::SUCCESS.ord() as i64 {
+            godot_error!("Failed to send request: {:?}", result);
+            return;
+        }
+
+        if Os::singleton().is_debug_build() && DEBUG {
+            godot_print!("Request completed with response code: {}", response_code);
+            godot_print!("Response headers: {:?}", headers);
+            godot_print!(
+                "Response body:\n{}",
+                String::from_utf8_lossy(&body.to_vec())
+            );
+        }
+
+        self.busy = false;
 
         let mut json = Json::new_gd();
         json.parse(&body.get_string_from_utf8());
         let json = json.get_data().to::<VarDictionary>();
         let device_id = json.get("deviceId").unwrap_or(Variant::nil());
         if !device_id.is_nil() {
-            this.bind_mut().set_device_id(device_id.to_string());
+            self.set_device_id(device_id.to_string());
+            self.busy = false;
         }
-
-        Ok(HttpRequestResult {
-            result: godot::classes::http_request::Result::from_ord(result as i32),
-            response_code,
-            headers,
-            body,
-        })
     }
 }
 
