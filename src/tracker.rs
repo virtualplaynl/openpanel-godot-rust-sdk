@@ -197,10 +197,6 @@ impl INode for OpenPanelTracker {
         }
 
         if let Some(payload) = self.send_queue.pop_front() {
-            godot_print!(
-                "Sending payload: {}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
             self.send_request(payload);
         }
     }
