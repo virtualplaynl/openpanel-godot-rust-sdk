@@ -79,9 +79,7 @@ impl Analytics {
         force_in_editor: bool,
         disabled: bool,
     ) -> Gd<Self> {
-        godot_print!("Setting Analytics tracker");
-
-        Gd::from_init_fn(|base| {
+        let new_instance = Gd::from_init_fn(|base| {
             // Accept a base of type Base<Node3D> and directly forward it.
             Self {
                 tracker: Some(tracker),
@@ -91,7 +89,10 @@ impl Analytics {
                 disabled,
                 base,
             }
-        })
+        });
+
+        INSTANCE.with(|cell| cell.replace(Some(new_instance.clone())));
+        new_instance
     }
 
     pub fn tracker(&mut self) -> Option<Gd<OpenPanelTracker>> {
@@ -163,30 +164,28 @@ impl Analytics {
         );
 
         if let Some(mut tracker) = self.tracker() {
-            tracker.bind_mut().set(
-                url,
-                client_id,
-                client_secret,
-                self.store_session_device,
-                self.force_in_editor,
-                self.disabled,
-            );
-
-            tracker
-                .clone()
-                .bind_mut()
-                .set_global_properties(global_properties);
-
-            if tracker.bind().is_disabled() {
-                if Os::singleton().has_feature("engine") {
-                    godot_print!(
-                        "OpenPanel Analytics are disabled while running in engine\nYou can enable them by calling Analytics.force_in_editor() in your code"
-                    );
+            {
+                let mut tracker_binding = tracker.bind_mut();
+                tracker_binding.set(
+                    url,
+                    client_id,
+                    client_secret,
+                    self.store_session_device,
+                    self.force_in_editor,
+                    self.disabled,
+                );
+                tracker_binding.set_global_properties(global_properties);
+                if tracker_binding.is_disabled() {
+                    if Os::singleton().has_feature("editor") {
+                        godot_print!(
+                            "OpenPanel Analytics are disabled while running in editor\nYou can enable them by calling Analytics.force_in_editor() in your code"
+                        );
+                    } else {
+                        godot_print!("OpenPanel Analytics are disabled");
+                    }
                 } else {
-                    godot_print!("OpenPanel Analytics are disabled");
+                    tracker_binding.track("app_started", None, None);
                 }
-            } else {
-                tracker.bind_mut().track("app_started", None, None);
             }
         } else {
             godot_error!(

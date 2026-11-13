@@ -49,9 +49,8 @@ use godot::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
-use std::thread::sleep;
 
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
 /// Type of event to track
 #[derive(Debug, Default, Serialize)]
@@ -188,7 +187,6 @@ impl INode for OpenPanelTracker {
                 "Sending payload: {}",
                 serde_json::to_string_pretty(&payload).unwrap_or_default()
             );
-            self.busy = true;
             self.send_request(payload);
         }
     }
@@ -487,6 +485,8 @@ impl OpenPanelTracker {
 
     /// Actually send the request to the API
     fn send_request(&mut self, payload: serde_json::Value) {
+        self.busy = true;
+
         let mut client = self.http_client.clone();
 
         if self.disabled {
@@ -496,13 +496,6 @@ impl OpenPanelTracker {
         if Os::singleton().has_feature("editor") && !self.force_in_editor {
             return;
         }
-
-        while self.busy {
-            godot_print!("Waiting for previous request to complete...");
-            sleep(std::time::Duration::from_millis(100));
-        }
-
-        self.busy = true;
 
         if Os::singleton().is_debug_build() && DEBUG {
             godot_print!("Sending request to {}", self.api_url);
