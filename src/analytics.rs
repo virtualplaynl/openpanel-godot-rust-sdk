@@ -184,7 +184,7 @@ impl Analytics {
                         godot_print!("OpenPanel Analytics are disabled");
                     }
                 } else {
-                    tracker_binding.track("app_started", None, None);
+                    tracker_binding.track("app_started", None, None, None);
                 }
             }
         } else {
@@ -225,6 +225,7 @@ impl Analytics {
         event: &str,
         profile_id: Option<String>,
         properties: Option<Dictionary<GString, GString>>,
+        groups: Option<Array<GString>>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
         if let Some(tracker) = self.tracker() {
@@ -241,7 +242,7 @@ impl Analytics {
             godot::task::spawn(async move {
                 tracker
                     .bind_mut()
-                    .track(event.as_str(), profile_id, properties);
+                    .track(event.as_str(), profile_id, properties, groups);
             });
         } else {
             godot_error!("Analytics tracker not initialized");
@@ -289,13 +290,25 @@ impl Analytics {
     }
 
     #[func]
-    pub fn track_event(event: GString, properties: Variant) {
-        Self::track(&event.to_string(), properties);
+    pub fn track_event(event: GString, properties: Variant, groups: Variant) {
+        if groups.is_nil() {
+            Self::track(&event.to_string(), properties, None);
+        } else if let Ok(groups_array) = groups.try_to::<Array<GString>>() {
+            Self::track(&event.to_string(), properties, Some(groups_array));
+        } else {
+            godot_error!("Invalid groups parameter for track_event");
+        }
     }
 
-    pub fn track(event: &str, properties: Variant) {
+    pub fn track(event: &str, properties: Variant, groups: Option<Array<GString>>) {
         _ = Self::with_instance(|analytics| {
-            analytics._track_event_internal(event, None, try_to_string_dict(&properties), None);
+            analytics._track_event_internal(
+                event,
+                None,
+                try_to_string_dict(&properties),
+                groups.clone(),
+                None,
+            );
         });
     }
 
@@ -303,13 +316,20 @@ impl Analytics {
         &mut self,
         event: &str,
         properties: HashMap<String, String>,
+        groups: Option<Array<GString>>,
     ) {
-        self._track_event_internal(event, None, Some(hashmap_to_dict(properties)), None);
+        self._track_event_internal(event, None, Some(hashmap_to_dict(properties)), groups, None);
     }
 
     #[func]
-    pub fn track_event_bare(&mut self, event: String) {
-        self._track_event_internal(event.as_str(), None, None, None);
+    pub fn track_event_bare(&mut self, event: String, groups: Variant) {
+        if groups.is_nil() {
+            self._track_event_internal(event.as_str(), None, None, None, None);
+        } else if let Ok(groups_array) = groups.try_to::<Array<GString>>() {
+            self._track_event_internal(event.as_str(), None, None, Some(groups_array), None);
+        } else {
+            godot_error!("Invalid groups parameter for track_event_bare");
+        }
     }
 
     pub fn track_event_with_profile_id_and_properties(
@@ -317,11 +337,13 @@ impl Analytics {
         event: String,
         profile_id: String,
         properties: HashMap<String, String>,
+        groups: Option<Array<GString>>,
     ) {
         self._track_event_internal(
             event.as_str(),
             Some(profile_id),
             Some(hashmap_to_dict(properties)),
+            groups,
             None,
         );
     }
@@ -332,13 +354,27 @@ impl Analytics {
         event: String,
         profile_id: String,
         properties: Variant,
+        groups: Variant,
     ) {
-        self._track_event_internal(
-            event.as_str(),
-            Some(profile_id),
-            try_to_string_dict(&properties),
-            None,
-        );
+        if groups.is_nil() {
+            self._track_event_internal(
+                event.as_str(),
+                Some(profile_id),
+                try_to_string_dict(&properties),
+                None,
+                None,
+            );
+        } else if let Ok(groups_array) = groups.try_to::<Array<GString>>() {
+            self._track_event_internal(
+                event.as_str(),
+                Some(profile_id),
+                try_to_string_dict(&properties),
+                Some(groups_array),
+                None,
+            );
+        } else {
+            godot_error!("Invalid groups parameter for track_event_with_profile_id");
+        }
     }
 
     pub fn track_event_with_filter(
@@ -346,11 +382,13 @@ impl Analytics {
         event: String,
         properties: Option<HashMap<String, String>>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
+        groups: Option<Array<GString>>,
     ) {
         self._track_event_internal(
             event.as_str(),
             None,
             properties.map(|p| hashmap_to_dict(p)),
+            groups,
             filter,
         );
     }
@@ -360,12 +398,14 @@ impl Analytics {
         event: String,
         profile_id: Option<String>,
         properties: Option<HashMap<String, String>>,
+        groups: Option<Array<GString>>,
         filter: Option<&dyn Fn(HashMap<String, String>) -> bool>,
     ) {
         self._track_event_internal(
             event.as_str(),
             profile_id,
             properties.map(|p| hashmap_to_dict(p)),
+            groups,
             filter,
         );
     }

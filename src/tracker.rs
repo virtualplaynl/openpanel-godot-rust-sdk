@@ -41,13 +41,13 @@
 ///     Ok(())
 /// }
 /// ```
-use crate::{Analytics, TrackerError, TrackerResult, user};
+use crate::{Analytics, TrackerError, TrackerResult, group, user};
 use godot::classes::http_client::Method;
 use godot::classes::{ConfigFile, Engine, HttpRequest, Json, Os};
 use godot::global::Error;
 use godot::prelude::*;
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 
 const DEBUG: bool = false;
@@ -58,10 +58,14 @@ const DEBUG: bool = false;
 enum TrackType {
     /// Decrement property value on OpenPanel
     Decrement,
+    /// Create or update a group entity on OpenPanel
+    Group,
     /// Identify property value on OpenPanel
     Identify,
     /// Increment property value on OpenPanel
     Increment,
+    /// Link a profile to one or more groups on OpenPanel
+    AssignGroup,
     /// Track event on OpenPanel
     #[default]
     Track,
@@ -136,6 +140,7 @@ pub struct OpenPanelTracker {
     device_id: Option<String>,
     headers: Dictionary<GString, GString>,
     global_props: HashMap<String, String>,
+    groups: HashSet<String>,
     store_session_device: bool,
     force_in_editor: bool,
     disabled: bool,
@@ -151,7 +156,16 @@ impl INode for OpenPanelTracker {
             .unwrap_or_else(|_| "https://api.openpanel.dev".to_string());
         let client_id = std::env::var("OPENPANEL_CLIENT_ID").unwrap_or_default();
         let client_secret = std::env::var("OPENPANEL_CLIENT_SECRET").unwrap_or_default();
-        Self::_init_node(api_url, client_id, client_secret, true, false, true, base)
+        Self::_init_node(
+            api_url,
+            client_id,
+            client_secret,
+            HashSet::new(),
+            true,
+            false,
+            true,
+            base,
+        )
     }
 
     fn enter_tree(&mut self) {
@@ -203,6 +217,7 @@ impl OpenPanelTracker {
         api_url: String,
         client_id: String,
         client_secret: String,
+        groups: HashSet<String>,
         store_session_device: bool,
         force_in_editor: bool,
         disabled: bool,
@@ -232,6 +247,7 @@ impl OpenPanelTracker {
             } else {
                 HashMap::new()
             },
+            groups: groups,
             store_session_device: store_session_device,
             force_in_editor,
             disabled,
@@ -337,11 +353,33 @@ impl OpenPanelTracker {
         event: &str,
         profile_id: Option<String>,
         properties: Option<Dictionary<GString, GString>>,
+        groups: Option<Array<GString>>,
     ) {
         let properties_map = properties.map(|p| dict_to_hashmap(p));
 
         let properties = self.create_properties_with_globals(properties_map);
-        let payload = if profile_id.is_some() {
+        // Merge persistent groups with per-event groups
+        let merged_groups = {
+            match groups {
+                Some(event_groups) => {
+                    let mut merged = self.groups.clone();
+                    merged.extend(event_groups.iter_shared().map(|g| g.to_string()));
+                    if merged.is_empty() {
+                        None
+                    } else {
+                        Some(merged)
+                    }
+                }
+                None => {
+                    if self.groups.is_empty() {
+                        None
+                    } else {
+                        Some(self.groups.clone())
+                    }
+                }
+            }
+        };
+        let mut payload = if profile_id.is_some() {
             serde_json::json!({
                 "type": TrackType::Track,
                 "payload": {
@@ -360,6 +398,9 @@ impl OpenPanelTracker {
             })
         };
 
+        if let Some(ref g) = merged_groups {
+            payload["payload"]["groups"] = serde_json::json!(g);
+        }
         self.queue_request(payload);
     }
 
@@ -403,6 +444,139 @@ impl OpenPanelTracker {
         self.queue_request(payload);
     }
 
+    /// Create or update a group entity on OpenPanel.
+    ///
+    /// Use this to sync dynamic group metadata (plan, seats, MRR, etc.) from
+    /// your own data. Call it on login or when group properties change — not on
+    /// every request.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use openpanel_sdk::sdk::{group::Group, Tracker};
+    /// use std::collections::HashMap;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> anyhow::Result<()> {
+    ///     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+    ///     let group = Group {
+    ///         id: "org_acme".to_string(),
+    ///         group_type: "company".to_string(),
+    ///         name: "Acme Inc".to_string(),
+    ///         properties: HashMap::from([("plan".to_string(), "enterprise".to_string())]),
+    ///     };
+    ///     tracker.upsert_group(group).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn upsert_group(&mut self, group: group::Group) {
+        let payload = serde_json::json!({
+            "type": TrackType::Group,
+            "payload": group
+        });
+
+        self.queue_request(payload);
+    }
+
+    /// Link the current profile to a single group ID.
+    ///
+    /// Sends an `assign_group` event to OpenPanel and persists the group ID on
+    /// the SDK instance so that all subsequent `track()` calls automatically
+    /// include it.
+    ///
+    /// The group does not need to exist yet — events will be tagged with the
+    /// group ID and the group can be created later via `upsert_group` or in the
+    /// dashboard.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use openpanel_sdk::sdk::Tracker;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> anyhow::Result<()> {
+    ///     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+    ///     tracker.set_group("user_123".to_string(), "org_acme".to_string()).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn set_group(&mut self, profile_id: String, group_id: String) {
+        // Persist the group ID on the tracker instance
+        {
+            self.groups.insert(group_id.clone());
+        }
+
+        // Send the assign_group event
+        let payload = serde_json::json!({
+            "type": TrackType::AssignGroup,
+            "payload": {
+                "profileId": profile_id,
+                "groups": [group_id]
+            }
+        });
+
+        self.queue_request(payload);
+    }
+
+    /// Link the current profile to multiple group IDs at once.
+    ///
+    /// Sends a single `assign_group` event containing all provided group IDs
+    /// and persists them on the SDK instance so that all subsequent `track()`
+    /// calls automatically include them.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use openpanel_sdk::sdk::Tracker;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> anyhow::Result<()> {
+    ///     let tracker = Tracker::try_new_from_env()?.with_default_headers()?;
+    ///     tracker
+    ///         .set_groups(
+    ///             "user_123".to_string(),
+    ///             vec!["org_acme".to_string(), "team_engineering".to_string()],
+    ///         )
+    ///         .await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn set_groups(&mut self, profile_id: String, group_ids: Vec<String>) {
+        // Persist the group IDs on the tracker instance
+        {
+            self.groups.extend(group_ids.clone().into_iter());
+        }
+
+        // Send the assign_group event
+        let payload = serde_json::json!({
+            "type": TrackType::AssignGroup,
+            "payload": {
+                "profileId": profile_id,
+                "groups": group_ids
+            }
+        });
+
+        self.queue_request(payload);
+    }
+
+    /// Clear all persisted state on the tracker, including groups.
+    ///
+    /// Always call this on logout to prevent a new user from inheriting the
+    /// previous user's groups.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use openpanel_sdk::sdk::Tracker;
+    ///
+    /// fn handle_logout(tracker: &Tracker) {
+    ///     tracker.clear();
+    /// }
+    /// ```
+    pub fn clear(&mut self) {
+        self.groups.clear();
+    }
+
     pub fn revenue(
         &mut self,
         profile_id: Option<String>,
@@ -415,7 +589,12 @@ impl OpenPanelTracker {
 
         properties.extend(local_props);
 
-        self.track("revenue", profile_id, Some(hashmap_to_dict(properties)));
+        self.track(
+            "revenue",
+            profile_id,
+            Some(hashmap_to_dict(properties)),
+            None,
+        );
     }
 
     pub async fn fetch_device_id(&mut self) -> TrackerResult<String> {
@@ -786,6 +965,46 @@ impl OpenPanelTracker {
 
 //         assert!(!id.is_empty());
 
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_set_group_persists_group() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.disable();
+//         // Even though the tracker is disabled (send_request returns error),
+//         // the group ID should still be persisted.
+//         let _ = tracker
+//             .set_group("profile_123".to_string(), "org_acme".to_string())
+//             .await;
+//         let groups = tracker.groups.read().unwrap();
+//         assert!(groups.contains(&"org_acme".to_string()));
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_set_groups_persists_multiple() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.disable();
+//         let _ = tracker
+//             .set_groups(
+//                 "profile_123".to_string(),
+//                 vec!["org_acme".to_string(), "team_engineering".to_string()],
+//             )
+//             .await;
+//         let groups = tracker.groups.read().unwrap();
+//         assert!(groups.contains(&"org_acme".to_string()));
+//         assert!(groups.contains(&"team_engineering".to_string()));
+//         Ok(())
+//     }
+
+//     #[tokio::test]
+//     async fn can_clear_groups() -> anyhow::Result<()> {
+//         let tracker = Tracker::try_new_from_env()?.disable();
+//         let _ = tracker
+//             .set_group("profile_123".to_string(), "org_acme".to_string())
+//             .await;
+//         tracker.clear();
+//         let groups = tracker.groups.read().unwrap();
+//         assert!(groups.is_empty());
 //         Ok(())
 //     }
 // }

@@ -1,6 +1,7 @@
-mod analytics;
-pub mod tracker;
 /// OpenPanel SDK for tracking events
+mod analytics;
+mod group;
+pub mod tracker;
 mod user;
 pub use crate::{analytics::Analytics, user::IdentifyUser};
 
